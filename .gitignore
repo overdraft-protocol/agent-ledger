@@ -1,0 +1,4 @@
+.mcp-kv-store.json
+node_modules
+.env
+dist
