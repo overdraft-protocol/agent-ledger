@@ -1,21 +1,47 @@
 {
-  "name": "agent-ledger-mcp",
-  "version": "0.1.0",
+  "name": "agent-ledger",
+  "version": "0.2.0-dev",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
-    "agent-ledger-mcp": "dist/index.js"
+    "agent-ledger": "dist/index.js",
+    "agent-ledger-bootstrap": "dist/bootstrap.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev": "node --watch dist/index.js"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "typescript": "^5.8.3"
+    "dev": "tsc -p tsconfig.json --watch & node --watch --enable-source-maps dist/index.js",
+    "bootstrap": "node dist/bootstrap.js",
+    "migrate": "node dist/storage/postgres/migrate.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write ."
   },
   "dependencies": {
-    "dotenv": "^17.4.2"
+    "@hono/node-server": "^1.13.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^17.4.2",
+    "hono": "^4.6.0",
+    "jose": "^5.9.0",
+    "kysely": "^0.27.0",
+    "pg": "^8.13.0",
+    "pino": "^9.5.0",
+    "prom-client": "^15.1.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.0",
+    "eslint": "^9.13.0",
+    "fast-check": "^3.22.0",
+    "prettier": "^3.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
   }
 }

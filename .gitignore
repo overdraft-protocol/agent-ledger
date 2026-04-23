@@ -1,4 +1,22 @@
-.mcp-kv-store.json
 node_modules
-.env
 dist
+*.log
+.env
+.env.local
+
+# Blob store (filesystem backend)
+.blobs/
+
+# Legacy
+.mcp-kv-store.json
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Coverage / test output
+coverage/
+.vitest/

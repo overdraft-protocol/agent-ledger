@@ -1,0 +1,92 @@
+# Local development stack for agent-ledger.
+#
+#   docker compose up -d
+#
+# Services:
+#   - postgres: Postgres 17, primary data store
+#   - hydra:    Ory Hydra 2.x, OAuth 2.1 authorization server
+#   - hydra-migrate: one-shot migrator for Hydra's own schema
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: agent-ledger-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent_ledger
+      POSTGRES_PASSWORD: agent_ledger
+      POSTGRES_DB: agent_ledger
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - agent_ledger_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_ledger -d agent_ledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hydra-db:
+    image: postgres:17-alpine
+    container_name: agent-ledger-hydra-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra
+      POSTGRES_DB: hydra
+    volumes:
+      - hydra_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hydra-migrate:
+    image: oryd/hydra:v2.2.0
+    container_name: agent-ledger-hydra-migrate
+    depends_on:
+      hydra-db:
+        condition: service_healthy
+    environment:
+      DSN: postgres://hydra:hydra@hydra-db:5432/hydra?sslmode=disable
+    command: migrate sql -e --yes
+    restart: "no"
+
+  hydra:
+    image: oryd/hydra:v2.2.0
+    container_name: agent-ledger-hydra
+    restart: unless-stopped
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    environment:
+      DSN: postgres://hydra:hydra@hydra-db:5432/hydra?sslmode=disable
+      URLS_SELF_ISSUER: http://127.0.0.1:4444
+      URLS_CONSENT: http://127.0.0.1:3000/consent
+      URLS_LOGIN: http://127.0.0.1:3000/login
+      SECRETS_SYSTEM: change-me-change-me-change-me-change
+      OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES: public
+      STRATEGIES_ACCESS_TOKEN: jwt
+      TTL_ACCESS_TOKEN: 5m
+      TTL_REFRESH_TOKEN: 24h
+    ports:
+      - "127.0.0.1:4444:4444" # public
+      - "127.0.0.1:4445:4445" # admin
+    command: serve all --dev
+
+volumes:
+  agent_ledger_pg:
+  hydra_pg:
