@@ -11,7 +11,7 @@
     "agent-ledger-bootstrap": "dist/bootstrap.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp -r src/storage/postgres/migrations dist/storage/postgres/",
     "start": "node dist/index.js",
     "dev": "tsc -p tsconfig.json --watch & node --watch --enable-source-maps dist/index.js",
     "bootstrap": "node dist/bootstrap.js",

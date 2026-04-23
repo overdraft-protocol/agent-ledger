@@ -34,8 +34,12 @@ export function getDb(): Kysely<Database> {
 
 export async function closeDb(): Promise<void> {
   if (db) {
+    // db.destroy() ends the underlying pg.Pool; null pool too so a subsequent
+    // call doesn't try to end it a second time.
     await db.destroy();
     db = null;
+    pool = null;
+    return;
   }
   if (pool) {
     await pool.end();
