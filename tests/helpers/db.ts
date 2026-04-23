@@ -112,6 +112,7 @@ export async function truncateAll(db: Kysely<Database>): Promise<void> {
       locks, blob_refs, blobs,
       counters, log_entries, logs, docs,
       policies, transitions, schemas,
+      enrollment_requests,
       capabilities, admins, namespaces, agents
     RESTART IDENTITY CASCADE
   `.execute(db);

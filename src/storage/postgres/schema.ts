@@ -47,6 +47,8 @@ export interface Database {
   rate_buckets: RateBucketsTable;
   system_state: SystemStateTable;
 
+  enrollment_requests: EnrollmentRequestsTable;
+
   migrations: MigrationsTable;
 }
 
@@ -221,6 +223,28 @@ export interface SystemStateTable {
   key: string;
   value: JsonColumn;
   updated_at: Generated<Timestamp>;
+}
+
+export type EnrollmentStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "claimed"
+  | "expired";
+
+export interface EnrollmentRequestsTable {
+  id: Generated<string>;
+  oauth_subject: string;
+  note: string | null;
+  status: Generated<EnrollmentStatus>;
+  claim_secret_hash: Buffer | null;
+  agent_id: string | null;
+  reviewed_by_subject: string | null;
+  reject_reason: string | null;
+  requested_at: Generated<Timestamp>;
+  reviewed_at: Timestamp | null;
+  claimed_at: Timestamp | null;
+  expires_at: Timestamp;
 }
 
 export interface MigrationsTable {

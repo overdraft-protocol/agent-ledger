@@ -53,6 +53,75 @@ The intended deployment target for the first milestone is a single-machine LAN i
 
 ---
 
+## Onboarding external agents
+
+`bootstrap` (above) creates an agent for someone with shell access to the host. For agents that arrive over the network, use the operator-gated enrollment flow.
+
+The flow has three actors:
+
+1. **Agent** submits an enrollment request and receives an `enrollment_id` + a single-use `claim_secret`.
+2. **Operator** (you) reviews pending requests on the host and approves or rejects each one. Approval creates the underlying `agents` row.
+3. **Agent** exchanges the `enrollment_id` + `claim_secret` for the issued `agent_id`, then uses that as `X-Dev-Agent-Id` against `/mcp`.
+
+The two surfaces — `/enroll` (HTTP) and `/mcp/enroll` (MCP) — are equivalent; both are unauthenticated and call the same backend. Pick whichever fits the agent's tooling.
+
+### Agent: submit (HTTP)
+
+```bash
+curl -s http://<host>:3210/enroll \
+  -H "content-type: application/json" \
+  -d '{"oauth_subject": "alice-laptop", "note": "rotating my key"}'
+# {
+#   "enrollment_id": "...",
+#   "claim_secret": "...",     # save this — only shown here, never again
+#   "expires_at":   "...",
+#   "status":       "pending"
+# }
+```
+
+### Agent: submit (MCP)
+
+Point an MCP client at `http://<host>:3210/mcp/enroll` (no auth header). It exposes exactly two tools: `enrollment.submit` and `enrollment.claim`. No other ledger functionality is reachable from this endpoint.
+
+### Operator: review and approve
+
+On the host, with shell access:
+
+```bash
+npm run enroll -- list                       # show pending requests
+npm run enroll -- show <enrollment-id>       # full detail of one request
+npm run enroll -- approve <enrollment-id>    # prints AGENT_ID=...
+npm run enroll -- reject  <enrollment-id> --reason "no thanks"
+npm run enroll -- sweep                      # mark past-TTL rows expired
+```
+
+Approval is recorded with `reviewed_by_subject = <unix-user>@<host>` for audit. There is no other notion of operator identity — operator authority is "has shell on the box".
+
+### Agent: claim
+
+Polled by the agent until `status` is no longer `pending`:
+
+```bash
+curl -s http://<host>:3210/enroll/claim \
+  -H "content-type: application/json" \
+  -d '{"enrollment_id":"...","claim_secret":"..."}'
+# pending  -> {"status":"pending"}
+# approved -> {"status":"claimed","agent_id":"..."}    (one-shot; secret burned)
+# rejected/expired/wrong secret -> HTTP 404
+```
+
+A successful claim returns the `agent_id` exactly once and burns the secret. Subsequent calls with the same enrollment_id return 404.
+
+### Security properties
+
+- `claim_secret` is 256 bits of `crypto.randomBytes` returned to the submitter only. Only `sha256(secret)` is stored — a DB dump does not let an attacker claim approved requests.
+- Wrong secret, unknown `enrollment_id`, rejected, expired, or already-claimed all return the same `404 not_found` response, so the endpoint does not reveal which specific failure occurred.
+- Pending requests TTL out after 24 hours (sweep-on-write). Approved-but-unclaimed requests have their secret burned at TTL but the linkage to `agent_id` is preserved for audit.
+- One active (`pending` or `approved`) request per `oauth_subject`; subjects already mapped to a live agent cannot enroll again.
+- No rate limiting on `/enroll` or `/enroll/claim` yet — see Roadmap.
+
+---
+
 ## Verifying the server
 
 Health check (no auth):
@@ -172,7 +241,8 @@ src/
   mcp/         # MCP server assembly, tool registrations, ALS context carrier
   storage/     # Postgres pool, Kysely schema, numbered SQL migrations
   telemetry/   # pino logger
-  bootstrap.ts # CLI: create agent (+ optional namespace)
+  bootstrap.ts # CLI: create agent (+ optional namespace) on the host
+  enroll-cli.ts # CLI: list / approve / reject / sweep enrollment requests
   index.ts     # server entry
 ```
 
@@ -181,7 +251,7 @@ src/
 ## Roadmap
 
 - [ ] RFC 9068 JWT auth path (JWKS, blocklist, `sub` → agent-id resolver)
-- [ ] Rate limiting middleware
+- [ ] Rate limiting middleware (including per-IP cap on `/enroll` and `/enroll/claim`)
 - [ ] `log.tail` (LISTEN/NOTIFY server → client streaming)
 - [ ] Prometheus `/metrics` endpoint
 - [ ] `POLICY.register` API (the evaluator is implemented; the policy-rule registration surface is not yet exposed)

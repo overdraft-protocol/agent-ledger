@@ -8,16 +8,21 @@ import type { CallContext } from "../core/context.js";
 import { LedgerError } from "../core/errors.js";
 import { logger } from "../telemetry/logger.js";
 import { buildMcpServer } from "../mcp/server.js";
+import { buildEnrollmentMcpServer } from "../mcp/enroll.js";
 import { runWithCtx } from "../mcp/context.js";
+import { createEnrollmentRoutes } from "./enroll.js";
 
 // HTTP surface for the agent-ledger MCP server.
 //
-// /healthz  — unauthenticated liveness probe.
-// /mcp      — authenticated MCP Streamable HTTP endpoint (GET/POST/DELETE).
+// /healthz       — unauthenticated liveness probe.
+// /enroll, /enroll/claim — unauthenticated onboarding (HTTP).
+// /mcp/enroll    — unauthenticated MCP server exposing only enrollment tools.
+// /mcp           — authenticated MCP Streamable HTTP endpoint (GET/POST/DELETE).
 //
 // The MCP transport is stateless: a fresh WebStandardStreamableHTTPServerTransport
-// is built per request and connected to the process-wide McpServer. Tool handlers
-// recover the authenticated CallContext via AsyncLocalStorage (see src/mcp/context.ts).
+// is built per request and connected to a fresh McpServer. Tool handlers on the
+// authenticated path recover the CallContext via AsyncLocalStorage (see
+// src/mcp/context.ts). The enrollment server has no per-request state.
 
 type Variables = { ctx: CallContext };
 
@@ -26,6 +31,32 @@ export function createApp(): Hono<{ Variables: Variables }> {
   const app = new Hono<{ Variables: Variables }>();
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Unauthenticated enrollment surface — both the flat HTTP endpoints and the
+  // tiny MCP server. Body limit applies; no auth middleware. The two surfaces
+  // share the same control-plane backend (src/control/enrollment.ts), so the
+  // MCP variant cannot expose anything the HTTP variant doesn't.
+  const enroll = createEnrollmentRoutes();
+  const enrollOuter = new Hono();
+  enrollOuter.use("*", bodyLimit({ maxSize: cfg.MAX_REQUEST_BYTES }));
+  enrollOuter.route("/", enroll);
+  app.route("/enroll", enrollOuter);
+
+  const mcpEnroll = new Hono();
+  mcpEnroll.use("*", bodyLimit({ maxSize: cfg.MAX_REQUEST_BYTES }));
+  mcpEnroll.all("*", async (c) => {
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      enableJsonResponse: true,
+    });
+    const server = buildEnrollmentMcpServer();
+    await server.connect(transport);
+    try {
+      return await transport.handleRequest(c.req.raw);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+  app.route("/mcp/enroll", mcpEnroll);
 
   const mcp = new Hono<{ Variables: Variables }>();
   mcp.use("*", bodyLimit({ maxSize: cfg.MAX_REQUEST_BYTES }));
