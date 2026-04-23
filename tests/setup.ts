@@ -14,3 +14,4 @@ process.env["CURSOR_HMAC_KEY"] ??=
   "0000000000000000000000000000000000000000000000000000000000000000";
 process.env["BLOB_DIR"] ??= "./.blobs-test";
 process.env["LOG_LEVEL"] ??= "warn";
+process.env["ALLOW_DEV_AGENT_HEADER"] ??= "true";
