@@ -7,10 +7,17 @@ import {
   type SchemaDsl,
 } from "../core/schema.js";
 import { appendAudit } from "../core/audit.js";
+import { requireManageRoles } from "../core/capabilities.js";
 
 // Schema.register — control-plane handler for adding a new typed primitive
 // schema. Immutable once registered (I9); `deprecate` marks a version unusable
 // for new instances but leaves history intact.
+//
+// Schemas are an internal artifact of the protocol designer; they are not
+// exposed as a discoverable surface to ordinary agents (those see schemas
+// inlined in doc/log read responses and transition.get descriptions). The
+// gate is therefore `manage_roles` — the same gate used for role and
+// transition admin.
 
 const NAME_RE = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 
@@ -38,6 +45,7 @@ export async function registerSchema(
     dsl: unknown;
   },
 ): Promise<SchemaSummary> {
+  await requireManageRoles(db, input.namespaceId, input.registeredBy);
   if (!NAME_RE.test(input.name)) {
     throw new LedgerError("invalid_params", "schema name must match /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/");
   }
@@ -101,6 +109,7 @@ export async function deprecateSchema(
     version: number;
   },
 ): Promise<void> {
+  await requireManageRoles(db, input.namespaceId, input.actorAgentId);
   await db.transaction().execute(async (tx) => {
     const r = await tx
       .updateTable("schemas")

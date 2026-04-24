@@ -12,8 +12,6 @@ import {
 import {
   registerSchema,
   deprecateSchema,
-  listSchemas,
-  getSchema,
 } from "../control/schema.js";
 import {
   registerTransition,
@@ -22,28 +20,24 @@ import {
 } from "../control/transition.js";
 import { listTransitions } from "../core/transition/registry.js";
 import {
-  upsertPolicy,
-  deletePolicy,
-  listPolicies,
-} from "../control/policy.js";
-import {
-  grantAdmin,
-  revokeAdmin,
-  listAdmins,
-} from "../control/admin.js";
-import {
-  grantReadCapability,
-  grantInvokeCapability,
-  revokeCapability,
-  listCapabilities,
-} from "../control/capability.js";
+  createRole,
+  updateRole,
+  deleteRole,
+  listRoles,
+  getRole,
+  grantRole,
+  revokeRole,
+  listRoleMembers,
+  listMyRoles,
+} from "../control/role.js";
 
 import {
   requireRead,
-  requireInvoke,
-  requireAdmin,
+  requireManageRoles,
+  requireCanInvokeAsRequiredRole,
+  type RoleCapability,
 } from "../core/capabilities.js";
-import { parseSchemaDsl } from "../core/schema.js";
+import { parseSchemaDsl, loadSchema, type SchemaDsl } from "../core/schema.js";
 import { LedgerError } from "../core/errors.js";
 import {
   readAudit,
@@ -56,22 +50,58 @@ import { counterGet } from "../core/counter.js";
 import { lockInspect } from "../core/lock.js";
 import { blobPut, blobGet, blobExists } from "../core/blob.js";
 import { invoke } from "../core/transition/invoke.js";
+import type { Op } from "../core/transition/grammar.js";
+import type { Kysely } from "kysely";
+import type { Database } from "../storage/postgres/schema.js";
 
 // All MCP tool registrations. Each handler recovers request-scoped
 // CallContext via requireCtx() (ALS keyed), enforces authorization up-front
-// using the Tier-0/1/2 primitives in core/capabilities, then delegates to the
+// using the role-based primitives in core/capabilities, then delegates to the
 // domain module. Errors raised as LedgerError are surfaced to the client via
 // the result wrapper in ./result.ts.
 
 const UUID = z.string().uuid();
+const AGENT_ID_OR_WILDCARD = z.union([UUID, z.literal("*")]);
+
+const RoleCapInput = z.object({
+  scope_kind: z.enum(["read", "invoke", "manage_roles"]),
+  path_glob: z.string().min(1).max(512).nullable().optional(),
+  transition_name: z.string().min(1).max(128).nullable().optional(),
+});
+
+function normaliseRoleCap(input: z.infer<typeof RoleCapInput>): RoleCapability {
+  return {
+    scope_kind: input.scope_kind,
+    path_glob: input.path_glob ?? null,
+    transition_name: input.transition_name ?? null,
+  };
+}
+
+/**
+ * Check the namespace exists and is not tombstoned. Used for read-only
+ * discovery tools (transition.list/get) that any registered agent may call —
+ * no role required, just like reading a public API spec.
+ */
+async function requireNamespaceVisible(
+  db: Kysely<Database>,
+  namespaceId: string,
+): Promise<void> {
+  const ns = await db
+    .selectFrom("namespaces")
+    .select("id")
+    .where("id", "=", namespaceId)
+    .where("tombstoned_at", "is", null)
+    .executeTakeFirst();
+  if (!ns) {
+    throw new LedgerError("not_found", `namespace ${namespaceId} not found`);
+  }
+}
 
 export function registerAllTools(server: McpServer): void {
   registerNamespaceTools(server);
   registerSchemaTools(server);
+  registerRoleTools(server);
   registerTransitionTools(server);
-  registerPolicyTools(server);
-  registerAdminTools(server);
-  registerCapabilityTools(server);
   registerAuditTools(server);
   registerDataTools(server);
   registerBlobTools(server);
@@ -83,7 +113,12 @@ function registerNamespaceTools(server: McpServer): void {
   server.registerTool(
     "namespace.create",
     {
-      description: "Create a new namespace owned by the caller.",
+      description:
+        "Create a new namespace owned by the caller. The owner has full " +
+        "implicit access; everyone else gets access by being granted a role " +
+        "(see role.create / role.grant). Hint: your next step is usually " +
+        "role.create({ name: 'admin', capabilities: [{ scope_kind: 'manage_roles' }] }) " +
+        "so you can delegate further administration without giving away ownership.",
       inputSchema: {
         alias: z.string().min(1).max(64).optional(),
       },
@@ -102,7 +137,7 @@ function registerNamespaceTools(server: McpServer): void {
   server.registerTool(
     "namespace.list",
     {
-      description: "List namespaces the caller owns or administers.",
+      description: "List namespaces the caller owns or holds at least one role in.",
       inputSchema: {},
     },
     wrap("namespace.list", async () => {
@@ -118,6 +153,36 @@ function registerNamespaceTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "namespace.search",
+    {
+      description:
+        "Search all active namespaces on the ledger (not just your own). " +
+        "Optionally filter by alias substring. Use this to discover protocols " +
+        "created by other agents so you can collaborate with them.",
+      inputSchema: {
+        alias: z.string().max(64).optional(),
+        limit: z.number().int().positive().max(100).default(50),
+      },
+    },
+    wrap("namespace.search", async (args) => {
+      const ctx = requireCtx();
+      let q = ctx.db
+        .selectFrom("namespaces")
+        .select(["id", "alias", "owner_agent_id", "created_at"])
+        .where("tombstoned_at", "is", null);
+      if (args.alias !== undefined) {
+        q = q.where("alias", "like", `%${args.alias}%`);
+      }
+      const rows = await q.orderBy("created_at", "desc").limit(args.limit).execute();
+      return rows.map((r) => ({
+        id: r.id,
+        alias: r.alias,
+        owner_agent_id: r.owner_agent_id,
+      }));
+    }),
+  );
+
+  server.registerTool(
     "namespace.tombstone",
     {
       description: "Soft-delete (tombstone) a namespace. Owner-only.",
@@ -125,15 +190,12 @@ function registerNamespaceTools(server: McpServer): void {
     },
     wrap("namespace.tombstone", async (args) => {
       const ctx = requireCtx();
-      // Ownership is enforced implicitly: only the owner's agent id can
-      // tombstone. Re-check here to emit a cleaner error than a stale no-op.
       const ns = await ctx.db
         .selectFrom("namespaces")
         .select(["owner_agent_id"])
         .where("id", "=", args.namespace_id)
         .executeTakeFirst();
       if (!ns || ns.owner_agent_id !== ctx.agentId) {
-        const { LedgerError } = await import("../core/errors.js");
         throw new LedgerError("forbidden", "only the namespace owner may tombstone");
       }
       await tombstoneNamespace(ctx.db, {
@@ -147,12 +209,21 @@ function registerNamespaceTools(server: McpServer): void {
 }
 
 // ---------- schema.* ----------
+//
+// schema.register / schema.deprecate / schema.validate only — schemas are an
+// internal artifact of the protocol designer. Agents discover types through
+// the inlined `schema_dsl` returned by doc.get / log.head / log.read and
+// transition.get's `outputs` field.
 
 function registerSchemaTools(server: McpServer): void {
   server.registerTool(
     "schema.register",
     {
-      description: "Register a new typed-primitive schema (name, version).",
+      description:
+        "Register a new typed-primitive schema (name, version). Requires " +
+        "manage_roles. Schemas are immutable once registered. Agents do not " +
+        "need to call this directly — schemas are surfaced inlined wherever " +
+        "they are needed.",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -162,7 +233,6 @@ function registerSchemaTools(server: McpServer): void {
     },
     wrap("schema.register", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
       const r = await registerSchema(ctx.db, {
         namespaceId: args.namespace_id,
         registeredBy: ctx.agentId,
@@ -176,42 +246,11 @@ function registerSchemaTools(server: McpServer): void {
   );
 
   server.registerTool(
-    "schema.list",
-    {
-      description: "List registered schemas in a namespace.",
-      inputSchema: {
-        namespace_id: UUID,
-        include_deprecated: z.boolean().default(false),
-      },
-    },
-    wrap("schema.list", async (args) => {
-      const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      return await listSchemas(ctx.db, args.namespace_id, args.include_deprecated);
-    }),
-  );
-
-  server.registerTool(
-    "schema.get",
-    {
-      description: "Fetch a schema (DSL + JSON Schema) by name and version.",
-      inputSchema: {
-        namespace_id: UUID,
-        name: z.string().min(1).max(128),
-        version: z.number().int().positive(),
-      },
-    },
-    wrap("schema.get", async (args) => {
-      const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      return await getSchema(ctx.db, args.namespace_id, args.name, args.version);
-    }),
-  );
-
-  server.registerTool(
     "schema.deprecate",
     {
-      description: "Mark a schema version deprecated. New instances refused; history kept.",
+      description:
+        "Mark a schema version deprecated. New instances refused; history kept. " +
+        "Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -220,7 +259,6 @@ function registerSchemaTools(server: McpServer): void {
     },
     wrap("schema.deprecate", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
       await deprecateSchema(ctx.db, {
         namespaceId: args.namespace_id,
         actorAgentId: ctx.agentId,
@@ -236,7 +274,10 @@ function registerSchemaTools(server: McpServer): void {
     "schema.validate",
     {
       description:
-        "Validate a schema DSL object without registering it. Use this to test your DSL before calling schema.register. Returns { valid: true } or { valid: false, error: string }. No namespace or capability required.",
+        "Validate a schema DSL object without registering it. Use this to " +
+        "test your DSL before calling schema.register. Returns " +
+        "{ valid: true } or { valid: false, error: string }. No namespace " +
+        "or capability required.",
       inputSchema: { dsl: z.unknown() },
     },
     wrap("schema.validate", async (args) => {
@@ -258,13 +299,256 @@ function registerSchemaTools(server: McpServer): void {
   );
 }
 
+// ---------- role.* ----------
+
+function registerRoleTools(server: McpServer): void {
+  server.registerTool(
+    "role.create",
+    {
+      description:
+        "Create a new role in a namespace. Requires manage_roles. Caller " +
+        "may only grant capabilities they themselves currently hold (no " +
+        "privilege escalation). Capability shapes: " +
+        "{scope_kind:'read', path_glob}, {scope_kind:'invoke', transition_name}, " +
+        "{scope_kind:'manage_roles'}. Use transition_name='*' to permit any " +
+        "transition.",
+      inputSchema: {
+        namespace_id: UUID,
+        name: z.string().min(1).max(128),
+        description: z.string().max(4096).default(""),
+        capabilities: z.array(RoleCapInput).default([]),
+      },
+    },
+    wrap("role.create", async (args) => {
+      const ctx = requireCtx();
+      return await createRole(ctx.db, {
+        namespaceId: args.namespace_id,
+        actorAgentId: ctx.agentId,
+        requestId: ctx.requestId,
+        name: args.name,
+        description: args.description,
+        capabilities: args.capabilities.map(normaliseRoleCap),
+      });
+    }),
+  );
+
+  server.registerTool(
+    "role.update",
+    {
+      description:
+        "Update a role's description and/or replace its capability set. " +
+        "Requires manage_roles. No-escalation rule applies to capabilities.",
+      inputSchema: {
+        namespace_id: UUID,
+        name: z.string().min(1).max(128),
+        description: z.string().max(4096).optional(),
+        capabilities: z.array(RoleCapInput).optional(),
+      },
+    },
+    wrap("role.update", async (args) => {
+      const ctx = requireCtx();
+      const input: Parameters<typeof updateRole>[1] = {
+        namespaceId: args.namespace_id,
+        actorAgentId: ctx.agentId,
+        requestId: ctx.requestId,
+        name: args.name,
+      };
+      if (args.description !== undefined) input.description = args.description;
+      if (args.capabilities !== undefined) {
+        input.capabilities = args.capabilities.map(normaliseRoleCap);
+      }
+      return await updateRole(ctx.db, input);
+    }),
+  );
+
+  server.registerTool(
+    "role.delete",
+    {
+      description:
+        "Delete a role. Requires manage_roles. Refused if the role is " +
+        "referenced as `required_role` by any non-deprecated transition.",
+      inputSchema: {
+        namespace_id: UUID,
+        name: z.string().min(1).max(128),
+      },
+    },
+    wrap("role.delete", async (args) => {
+      const ctx = requireCtx();
+      await deleteRole(ctx.db, {
+        namespaceId: args.namespace_id,
+        actorAgentId: ctx.agentId,
+        requestId: ctx.requestId,
+        name: args.name,
+      });
+      return { deleted: true };
+    }),
+  );
+
+  server.registerTool(
+    "role.list",
+    {
+      description:
+        "List all roles in a namespace. Visible to anyone who can see the " +
+        "namespace (no role required) so agents can discover what roles " +
+        "they could request to join.",
+      inputSchema: { namespace_id: UUID },
+    },
+    wrap("role.list", async (args) => {
+      const ctx = requireCtx();
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+      return await listRoles(ctx.db, args.namespace_id);
+    }),
+  );
+
+  server.registerTool(
+    "role.get",
+    {
+      description:
+        "Fetch a role's full capability set. Visible to anyone who can see " +
+        "the namespace.",
+      inputSchema: {
+        namespace_id: UUID,
+        name: z.string().min(1).max(128),
+      },
+    },
+    wrap("role.get", async (args) => {
+      const ctx = requireCtx();
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+      return await getRole(ctx.db, args.namespace_id, args.name);
+    }),
+  );
+
+  server.registerTool(
+    "role.grant",
+    {
+      description:
+        "Grant a role to an agent. Requires manage_roles. Pass agent_id='*' " +
+        "to grant the role to every authenticated agent (wildcard / guest " +
+        "membership).",
+      inputSchema: {
+        namespace_id: UUID,
+        role: z.string().min(1).max(128),
+        agent_id: AGENT_ID_OR_WILDCARD,
+      },
+    },
+    wrap("role.grant", async (args) => {
+      const ctx = requireCtx();
+      await grantRole(ctx.db, {
+        namespaceId: args.namespace_id,
+        actorAgentId: ctx.agentId,
+        requestId: ctx.requestId,
+        role: args.role,
+        agentId: args.agent_id,
+      });
+      return { granted: true };
+    }),
+  );
+
+  server.registerTool(
+    "role.revoke",
+    {
+      description: "Revoke a role membership from an agent. Requires manage_roles.",
+      inputSchema: {
+        namespace_id: UUID,
+        role: z.string().min(1).max(128),
+        agent_id: AGENT_ID_OR_WILDCARD,
+      },
+    },
+    wrap("role.revoke", async (args) => {
+      const ctx = requireCtx();
+      await revokeRole(ctx.db, {
+        namespaceId: args.namespace_id,
+        actorAgentId: ctx.agentId,
+        requestId: ctx.requestId,
+        role: args.role,
+        agentId: args.agent_id,
+      });
+      return { revoked: true };
+    }),
+  );
+
+  server.registerTool(
+    "role.list_members",
+    {
+      description: "List members of a role. Requires manage_roles.",
+      inputSchema: {
+        namespace_id: UUID,
+        role: z.string().min(1).max(128),
+      },
+    },
+    wrap("role.list_members", async (args) => {
+      const ctx = requireCtx();
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
+      return await listRoleMembers(ctx.db, args.namespace_id, args.role);
+    }),
+  );
+
+  server.registerTool(
+    "role.list_my_roles",
+    {
+      description:
+        "List the roles the caller currently holds in a namespace " +
+        "(direct memberships and wildcard grants).",
+      inputSchema: { namespace_id: UUID },
+    },
+    wrap("role.list_my_roles", async (args) => {
+      const ctx = requireCtx();
+      return await listMyRoles(ctx.db, args.namespace_id, ctx.agentId);
+    }),
+  );
+}
+
 // ---------- transition.* ----------
+
+async function buildTransitionOutputs(
+  db: Kysely<Database>,
+  namespaceId: string,
+  ops: Op[],
+): Promise<Array<{
+  kind: "doc.put" | "log.create";
+  schema_name: string;
+  schema_version: number;
+  schema_dsl: SchemaDsl;
+}>> {
+  const seen = new Set<string>();
+  const out: Array<{
+    kind: "doc.put" | "log.create";
+    schema_name: string;
+    schema_version: number;
+    schema_dsl: SchemaDsl;
+  }> = [];
+  for (const op of ops) {
+    if (op.o !== "doc.put" && op.o !== "log.create") continue;
+    const key = `${op.o}:${op.schema_name}@${op.schema_version}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const { dsl } = await loadSchema(db, namespaceId, op.schema_name, op.schema_version);
+      out.push({
+        kind: op.o,
+        schema_name: op.schema_name,
+        schema_version: op.schema_version,
+        schema_dsl: dsl,
+      });
+    } catch {
+      // If a referenced schema is somehow missing, skip rather than blocking
+      // discovery. transition.register validates referenced schemas at write
+      // time so this is only reachable in pathological hand-edited states.
+    }
+  }
+  return out;
+}
 
 function registerTransitionTools(server: McpServer): void {
   server.registerTool(
     "transition.register",
     {
-      description: "Register a transition definition (params_schema, asserts, ops).",
+      description:
+        "Register a transition definition (params_schema, asserts, ops). " +
+        "Requires manage_roles. " +
+        "`description` is shown to discovering agents via transition.get; " +
+        "`required_role` names the role an agent must hold to invoke this " +
+        "transition (null = owner-only).",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -272,6 +556,8 @@ function registerTransitionTools(server: McpServer): void {
         params_schema: z.unknown(),
         asserts: z.unknown(),
         ops: z.unknown(),
+        description: z.string().max(4096).default(""),
+        required_role: z.string().min(1).max(128).nullable().default(null),
       },
     },
     wrap("transition.register", async (args) => {
@@ -285,6 +571,8 @@ function registerTransitionTools(server: McpServer): void {
         params_schema: args.params_schema,
         asserts: args.asserts,
         ops: args.ops,
+        description: args.description,
+        required_role: args.required_role,
       });
       return { registered: true };
     }),
@@ -293,7 +581,10 @@ function registerTransitionTools(server: McpServer): void {
   server.registerTool(
     "transition.list",
     {
-      description: "List registered transitions in a namespace.",
+      description:
+        "List registered transitions in a namespace. Each entry includes " +
+        "`description` and `required_role` so agents can decide which to " +
+        "invoke. Visible to anyone who can see the namespace.",
       inputSchema: {
         namespace_id: UUID,
         include_deprecated: z.boolean().default(false),
@@ -301,7 +592,7 @@ function registerTransitionTools(server: McpServer): void {
     },
     wrap("transition.list", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
       return await listTransitions(ctx.db, args.namespace_id, args.include_deprecated);
     }),
   );
@@ -309,7 +600,10 @@ function registerTransitionTools(server: McpServer): void {
   server.registerTool(
     "transition.get",
     {
-      description: "Fetch a transition definition by name and version.",
+      description:
+        "Fetch a transition's full definition (params_schema, description, " +
+        "required_role) and its declared output schemas. Visible to anyone " +
+        "who can see the namespace — this is the public interface.",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -318,15 +612,29 @@ function registerTransitionTools(server: McpServer): void {
     },
     wrap("transition.get", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      return await getTransition(ctx.db, args.namespace_id, args.name, args.version);
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+      const t = await getTransition(ctx.db, args.namespace_id, args.name, args.version);
+      const outputs = await buildTransitionOutputs(ctx.db, args.namespace_id, t.def.ops);
+      return {
+        name: t.name,
+        version: t.version,
+        description: t.description,
+        required_role: t.required_role,
+        deprecated: t.deprecated,
+        registered_at: t.registered_at,
+        registered_by: t.registered_by,
+        params_schema: t.def.params_schema,
+        outputs,
+      };
     }),
   );
 
   server.registerTool(
     "transition.deprecate",
     {
-      description: "Mark a transition version deprecated. Invocation refused; history kept.",
+      description:
+        "Mark a transition version deprecated. Invocation refused; history " +
+        "kept. Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -347,213 +655,13 @@ function registerTransitionTools(server: McpServer): void {
   );
 }
 
-// ---------- policy.* ----------
-
-function registerPolicyTools(server: McpServer): void {
-  server.registerTool(
-    "policy.upsert",
-    {
-      description: "Insert or update a policy rule. Provide `id` to update; omit to insert.",
-      inputSchema: {
-        namespace_id: UUID,
-        id: UUID.optional(),
-        rule: z.unknown(),
-      },
-    },
-    wrap("policy.upsert", async (args) => {
-      const ctx = requireCtx();
-      const upsertInput: Parameters<typeof upsertPolicy>[1] = {
-        namespaceId: args.namespace_id,
-        updatedBy: ctx.agentId,
-        requestId: ctx.requestId,
-        rule: args.rule,
-      };
-      if (args.id !== undefined) upsertInput.id = args.id;
-      return await upsertPolicy(ctx.db, upsertInput);
-    }),
-  );
-
-  server.registerTool(
-    "policy.list",
-    {
-      description: "List policy rules for a namespace.",
-      inputSchema: { namespace_id: UUID },
-    },
-    wrap("policy.list", async (args) => {
-      const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      return await listPolicies(ctx.db, args.namespace_id);
-    }),
-  );
-
-  server.registerTool(
-    "policy.delete",
-    {
-      description: "Delete a policy rule by id.",
-      inputSchema: { namespace_id: UUID, policy_id: UUID },
-    },
-    wrap("policy.delete", async (args) => {
-      const ctx = requireCtx();
-      await deletePolicy(ctx.db, {
-        namespaceId: args.namespace_id,
-        policyId: args.policy_id,
-        actorAgentId: ctx.agentId,
-        requestId: ctx.requestId,
-      });
-      return { deleted: true };
-    }),
-  );
-}
-
-// ---------- admin.* ----------
-
-function registerAdminTools(server: McpServer): void {
-  server.registerTool(
-    "admin.grant",
-    {
-      description: "Promote an agent to admin of a namespace. Owner-only.",
-      inputSchema: { namespace_id: UUID, agent_id: UUID },
-    },
-    wrap("admin.grant", async (args) => {
-      const ctx = requireCtx();
-      await grantAdmin(ctx.db, {
-        namespaceId: args.namespace_id,
-        agentId: args.agent_id,
-        grantedBy: ctx.agentId,
-        requestId: ctx.requestId,
-      });
-      return { granted: true };
-    }),
-  );
-
-  server.registerTool(
-    "admin.revoke",
-    {
-      description: "Revoke an agent's admin membership on a namespace. Owner-only.",
-      inputSchema: { namespace_id: UUID, agent_id: UUID },
-    },
-    wrap("admin.revoke", async (args) => {
-      const ctx = requireCtx();
-      await revokeAdmin(ctx.db, {
-        namespaceId: args.namespace_id,
-        agentId: args.agent_id,
-        revokedBy: ctx.agentId,
-        requestId: ctx.requestId,
-      });
-      return { revoked: true };
-    }),
-  );
-
-  server.registerTool(
-    "admin.list",
-    {
-      description: "List admins of a namespace.",
-      inputSchema: { namespace_id: UUID },
-    },
-    wrap("admin.list", async (args) => {
-      const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      return await listAdmins(ctx.db, args.namespace_id);
-    }),
-  );
-}
-
-// ---------- capability.* ----------
-
-function registerCapabilityTools(server: McpServer): void {
-  server.registerTool(
-    "capability.grant",
-    {
-      description:
-        "Grant a read or invoke capability. For read supply path_glob; for invoke supply transition_name.",
-      inputSchema: {
-        namespace_id: UUID,
-        agent_id: UUID,
-        scope_kind: z.enum(["read", "invoke"]),
-        path_glob: z.string().min(1).max(512).optional(),
-        transition_name: z.string().min(1).max(128).optional(),
-        expires_at: z.string().datetime().optional(),
-      },
-    },
-    wrap("capability.grant", async (args) => {
-      const ctx = requireCtx();
-      const expiresAt = args.expires_at ? new Date(args.expires_at) : undefined;
-      if (args.scope_kind === "read") {
-        if (!args.path_glob) {
-          const { LedgerError } = await import("../core/errors.js");
-          throw new LedgerError("invalid_params", "path_glob required for read capability");
-        }
-        const input: Parameters<typeof grantReadCapability>[1] = {
-          namespaceId: args.namespace_id,
-          agentId: args.agent_id,
-          pathGlob: args.path_glob,
-          grantedBy: ctx.agentId,
-          requestId: ctx.requestId,
-        };
-        if (expiresAt !== undefined) input.expiresAt = expiresAt;
-        return await grantReadCapability(ctx.db, input);
-      } else {
-        if (!args.transition_name) {
-          const { LedgerError } = await import("../core/errors.js");
-          throw new LedgerError("invalid_params", "transition_name required for invoke capability");
-        }
-        const input: Parameters<typeof grantInvokeCapability>[1] = {
-          namespaceId: args.namespace_id,
-          agentId: args.agent_id,
-          transitionName: args.transition_name,
-          grantedBy: ctx.agentId,
-          requestId: ctx.requestId,
-        };
-        if (expiresAt !== undefined) input.expiresAt = expiresAt;
-        return await grantInvokeCapability(ctx.db, input);
-      }
-    }),
-  );
-
-  server.registerTool(
-    "capability.revoke",
-    {
-      description: "Revoke a capability by id.",
-      inputSchema: { namespace_id: UUID, capability_id: UUID },
-    },
-    wrap("capability.revoke", async (args) => {
-      const ctx = requireCtx();
-      await revokeCapability(ctx.db, {
-        namespaceId: args.namespace_id,
-        capabilityId: args.capability_id,
-        revokedBy: ctx.agentId,
-        requestId: ctx.requestId,
-      });
-      return { revoked: true };
-    }),
-  );
-
-  server.registerTool(
-    "capability.list",
-    {
-      description: "List capabilities granted in a namespace. Optional agent filter.",
-      inputSchema: {
-        namespace_id: UUID,
-        agent_id: UUID.optional(),
-      },
-    },
-    wrap("capability.list", async (args) => {
-      const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
-      const filter: { agentId?: string } = {};
-      if (args.agent_id !== undefined) filter.agentId = args.agent_id;
-      return await listCapabilities(ctx.db, args.namespace_id, filter);
-    }),
-  );
-}
-
 // ---------- audit.* ----------
 
 function registerAuditTools(server: McpServer): void {
   server.registerTool(
     "audit.read",
     {
-      description: "Read audit entries from a namespace starting at from_seq.",
+      description: "Read audit entries from a namespace starting at from_seq. Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         from_seq: z.string().regex(/^\d+$/),
@@ -562,7 +670,7 @@ function registerAuditTools(server: McpServer): void {
     },
     wrap("audit.read", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const rows = await readAudit(ctx.db, args.namespace_id, BigInt(args.from_seq), args.limit);
       return rows.map((r) => ({
         seq: r.seq,
@@ -581,12 +689,12 @@ function registerAuditTools(server: McpServer): void {
   server.registerTool(
     "audit.head",
     {
-      description: "Fetch the current audit head (latest seq + chain hash).",
+      description: "Fetch the current audit head (latest seq + chain hash). Requires manage_roles.",
       inputSchema: { namespace_id: UUID },
     },
     wrap("audit.head", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const h = await getAuditHead(ctx.db, args.namespace_id);
       if (!h) return null;
       return { seq: h.seq.toString(), chain_hash: h.chainHash.toString("hex") };
@@ -596,7 +704,7 @@ function registerAuditTools(server: McpServer): void {
   server.registerTool(
     "audit.verify",
     {
-      description: "Verify the audit chain over [from_seq, to_seq].",
+      description: "Verify the audit chain over [from_seq, to_seq]. Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         from_seq: z.string().regex(/^\d+$/),
@@ -605,7 +713,7 @@ function registerAuditTools(server: McpServer): void {
     },
     wrap("audit.verify", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const r = await verifyAudit(
         ctx.db,
         args.namespace_id,
@@ -626,7 +734,10 @@ function registerDataTools(server: McpServer): void {
   server.registerTool(
     "tx.invoke",
     {
-      description: "Invoke a registered transition atomically.",
+      description:
+        "Invoke a registered transition atomically. Caller must hold the " +
+        "transition's `required_role` (or be the namespace owner). Use " +
+        "transition.get to discover what role is needed.",
       inputSchema: {
         namespace_id: UUID,
         transition_name: z.string().min(1).max(128),
@@ -637,7 +748,34 @@ function registerDataTools(server: McpServer): void {
     },
     wrap("tx.invoke", async (args) => {
       const ctx = requireCtx();
-      await requireInvoke(ctx.db, args.namespace_id, ctx.agentId, args.transition_name);
+      // Resolve the active transition to find its required_role. We deliberately
+      // do this before invoke() so unauthorised callers fail fast with the
+      // role-aware error rather than the generic capability_missing one.
+      const row = await ctx.db
+        .selectFrom("transitions")
+        .select(["required_role", "deprecated_at"])
+        .where("namespace_id", "=", args.namespace_id)
+        .where("name", "=", args.transition_name)
+        .where((eb) => {
+          if (args.transition_version !== undefined) {
+            return eb("version", "=", args.transition_version);
+          }
+          return eb("deprecated_at", "is", null);
+        })
+        .orderBy("version", "desc")
+        .limit(1)
+        .executeTakeFirst();
+      if (!row) {
+        throw new LedgerError("transition_unavailable",
+          `transition ${args.transition_name} not registered`);
+      }
+      await requireCanInvokeAsRequiredRole(
+        ctx.db,
+        args.namespace_id,
+        ctx.agentId,
+        args.transition_name,
+        row.required_role,
+      );
       const input: Parameters<typeof invoke>[1] = {
         namespaceId: args.namespace_id,
         agentId: ctx.agentId,
@@ -654,7 +792,10 @@ function registerDataTools(server: McpServer): void {
   server.registerTool(
     "doc.get",
     {
-      description: "Fetch a document by path.",
+      description:
+        "Fetch a document by path. Response includes the document's bound " +
+        "schema_dsl so the caller can interpret the value without a separate " +
+        "schema lookup.",
       inputSchema: {
         namespace_id: UUID,
         path: z.string().min(1).max(512),
@@ -663,14 +804,26 @@ function registerDataTools(server: McpServer): void {
     wrap("doc.get", async (args) => {
       const ctx = requireCtx();
       await requireRead(ctx.db, args.namespace_id, ctx.agentId, args.path);
-      return await docGet(ctx.db, args.namespace_id, args.path);
+      const doc = await docGet(ctx.db, args.namespace_id, args.path);
+      if (!doc) return null;
+      let schema_dsl: SchemaDsl | null = null;
+      try {
+        const { dsl } = await loadSchema(ctx.db, args.namespace_id, doc.schema_name, doc.schema_version);
+        schema_dsl = dsl;
+      } catch {
+        // Schema rows are immutable, but defensive: if the binding is broken
+        // surface the doc anyway with a null schema_dsl.
+      }
+      return { ...doc, schema_dsl };
     }),
   );
 
   server.registerTool(
     "log.read",
     {
-      description: "Read entries from a log starting at from_offset.",
+      description:
+        "Read entries from a log starting at from_offset. Response includes " +
+        "the log's bound schema_dsl so the caller can interpret entries.",
       inputSchema: {
         namespace_id: UUID,
         log_id: z.string().min(1).max(128),
@@ -680,16 +833,33 @@ function registerDataTools(server: McpServer): void {
     },
     wrap("log.read", async (args) => {
       const ctx = requireCtx();
-      // Capabilities over logs are authored as path-globs matching the log_id.
       await requireRead(ctx.db, args.namespace_id, ctx.agentId, args.log_id);
-      return await logRead(ctx.db, args.namespace_id, args.log_id, BigInt(args.from_offset), args.limit);
+      const entries = await logRead(
+        ctx.db, args.namespace_id, args.log_id, BigInt(args.from_offset), args.limit,
+      );
+      const head = await logGet(ctx.db, args.namespace_id, args.log_id);
+      let schema_dsl: SchemaDsl | null = null;
+      let schema_name: string | null = null;
+      let schema_version: number | null = null;
+      if (head) {
+        schema_name = head.schema_name;
+        schema_version = head.schema_version;
+        try {
+          const { dsl } = await loadSchema(ctx.db, args.namespace_id, head.schema_name, head.schema_version);
+          schema_dsl = dsl;
+        } catch {
+          /* fall through */
+        }
+      }
+      return { entries, schema_name, schema_version, schema_dsl };
     }),
   );
 
   server.registerTool(
     "log.head",
     {
-      description: "Fetch log metadata (schema binding + next offset).",
+      description:
+        "Fetch log metadata (schema binding, next offset, and inlined schema_dsl).",
       inputSchema: {
         namespace_id: UUID,
         log_id: z.string().min(1).max(128),
@@ -698,7 +868,16 @@ function registerDataTools(server: McpServer): void {
     wrap("log.head", async (args) => {
       const ctx = requireCtx();
       await requireRead(ctx.db, args.namespace_id, ctx.agentId, args.log_id);
-      return await logGet(ctx.db, args.namespace_id, args.log_id);
+      const head = await logGet(ctx.db, args.namespace_id, args.log_id);
+      if (!head) return null;
+      let schema_dsl: SchemaDsl | null = null;
+      try {
+        const { dsl } = await loadSchema(ctx.db, args.namespace_id, head.schema_name, head.schema_version);
+        schema_dsl = dsl;
+      } catch {
+        /* fall through */
+      }
+      return { ...head, schema_dsl };
     }),
   );
 
@@ -742,7 +921,8 @@ function registerBlobTools(server: McpServer): void {
     "blob.put",
     {
       description:
-        "Store a blob (base64-encoded). Server computes sha256 and returns it. Admin-only.",
+        "Store a blob (base64-encoded). Server computes sha256 and returns " +
+        "it. Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         content_base64: z.string().min(1),
@@ -751,7 +931,7 @@ function registerBlobTools(server: McpServer): void {
     },
     wrap("blob.put", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const bytes = Buffer.from(args.content_base64, "base64");
       return await blobPut(ctx.db, bytes, args.content_type ?? null);
     }),
@@ -760,7 +940,9 @@ function registerBlobTools(server: McpServer): void {
   server.registerTool(
     "blob.get",
     {
-      description: "Fetch a blob by sha256 (hex). Returns base64-encoded content. Admin-only.",
+      description:
+        "Fetch a blob by sha256 (hex). Returns base64-encoded content. " +
+        "Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         sha256: z.string().regex(/^[0-9a-f]{64}$/),
@@ -768,7 +950,7 @@ function registerBlobTools(server: McpServer): void {
     },
     wrap("blob.get", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const r = await blobGet(ctx.db, args.sha256);
       return {
         sha256: args.sha256,
@@ -782,7 +964,7 @@ function registerBlobTools(server: McpServer): void {
   server.registerTool(
     "blob.exists",
     {
-      description: "Check if a blob exists by sha256 (hex).",
+      description: "Check if a blob exists by sha256 (hex). Requires manage_roles.",
       inputSchema: {
         namespace_id: UUID,
         sha256: z.string().regex(/^[0-9a-f]{64}$/),
@@ -790,7 +972,7 @@ function registerBlobTools(server: McpServer): void {
     },
     wrap("blob.exists", async (args) => {
       const ctx = requireCtx();
-      await requireAdmin(ctx.db, args.namespace_id, ctx.agentId);
+      await requireManageRoles(ctx.db, args.namespace_id, ctx.agentId);
       const exists = await blobExists(ctx.db, args.sha256);
       return { exists };
     }),

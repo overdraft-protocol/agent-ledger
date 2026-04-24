@@ -32,8 +32,14 @@ export const authMiddleware = (): MiddlewareHandler<{ Variables: Variables }> =>
 
   return async (c, next) => {
     const devAgentId = c.req.header("x-dev-agent-id");
+    const ENROLL_INSTRUCTIONS =
+      "To obtain an agent id: (1) connect to /mcp/enroll and call enrollment.submit — this returns an enrollment_id and claim_secret; (2) an operator must approve your request before claim will succeed, which may take time — inform the user that approval is pending and ask them to re-prompt you once approved; (3) call enrollment.claim with your enrollment_id and claim_secret to receive your agent_id.";
+
     if (!devAgentId) {
-      throw new LedgerError("unauthenticated", "X-Dev-Agent-Id header required");
+      throw new LedgerError(
+        "unauthenticated",
+        `X-Dev-Agent-Id header required. ${ENROLL_INSTRUCTIONS}`,
+      );
     }
     if (!UUID_RE.test(devAgentId)) {
       throw new LedgerError("unauthenticated", "X-Dev-Agent-Id must be a UUID");
@@ -46,7 +52,10 @@ export const authMiddleware = (): MiddlewareHandler<{ Variables: Variables }> =>
       .where("id", "=", devAgentId)
       .executeTakeFirst();
     if (!agent) {
-      throw new LedgerError("unauthenticated", "unknown agent id");
+      throw new LedgerError(
+        "unauthenticated",
+        `Unknown agent id. ${ENROLL_INSTRUCTIONS}`,
+      );
     }
     if (agent.disabled_at !== null) {
       throw new LedgerError("unauthenticated", "agent is disabled");

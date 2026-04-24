@@ -175,41 +175,33 @@ Point any MCP client that supports Streamable HTTP transport at `http://<host>:3
 
 ## Tool surface
 
-Every tool requires the `X-Dev-Agent-Id` header (dev mode). Authorization tiers are enforced per-call inside each handler; no capability cache is built into the session.
+Every tool requires the `X-Dev-Agent-Id` header (dev mode). Authorization is enforced per-call inside each handler; no capability cache is built into the session.
 
-| Tool                       | Tier required                     |
-|----------------------------|-----------------------------------|
-| `namespace.create`         | any authenticated agent           |
-| `namespace.list`           | authenticated; returns only the namespaces the caller owns or administers |
-| `namespace.tombstone`      | owner                             |
-| `schema.register`          | admin                             |
-| `schema.list`              | admin                             |
-| `schema.get`               | admin                             |
-| `schema.deprecate`         | admin                             |
-| `transition.register`      | admin                             |
-| `transition.list`          | admin                             |
-| `transition.get`           | admin                             |
-| `transition.deprecate`     | admin                             |
-| `policy.upsert`            | admin                             |
-| `policy.list`              | admin                             |
-| `policy.delete`            | admin                             |
-| `admin.grant`              | owner                             |
-| `admin.revoke`             | owner                             |
-| `admin.list`               | admin                             |
-| `capability.grant`         | admin (or owner)                  |
-| `capability.revoke`        | admin (or owner)                  |
-| `capability.list`          | admin                             |
-| `audit.read`               | admin                             |
-| `audit.head`               | admin                             |
-| `audit.verify`             | admin                             |
-| `tx.invoke`                | invoke capability on the named transition |
-| `doc.get`                  | read capability matching the path |
-| `log.read` / `log.head`    | read capability matching the log id |
-| `counter.get`              | read capability matching the path |
-| `lock.inspect`             | read capability matching the path |
-| `blob.put` / `blob.get` / `blob.exists` | admin                |
+The model has two fixed primitives — **owner** (one per namespace, full implicit access) and **wildcard role membership** (`agent_id = '*'`) — and one user-defined primitive: **roles**, which are namespace-scoped named bundles of capabilities. The three capability kinds are `read` (path glob), `invoke` (transition name), and `manage_roles` (the meta-capability that gates all control-plane administration). Each transition declares a `required_role` that gates `tx.invoke`. There is no built-in "admin" tier; if you want one, create a role called `admin` and put `manage_roles` on it.
 
-Tier definitions live in `src/core/capabilities.ts`. Capabilities are resolved per request (no session caching), so revocations take effect on the very next call.
+| Tool                                    | Authorization                                                                 |
+|-----------------------------------------|-------------------------------------------------------------------------------|
+| `namespace.create`                      | any authenticated agent (caller becomes the owner)                            |
+| `namespace.list`                        | authenticated; returns namespaces the caller owns or holds any role in        |
+| `namespace.search`                      | authenticated; lists every active namespace (filterable by alias substring)   |
+| `namespace.tombstone`                   | owner                                                                         |
+| `schema.register` / `schema.deprecate`  | `manage_roles` (or owner) — schemas are an internal artifact                  |
+| `schema.validate`                       | unauthenticated dry-run (no namespace argument)                               |
+| `transition.register` / `.deprecate`    | `manage_roles` (or owner)                                                     |
+| `transition.list` / `.get`              | anyone who can see the namespace; response includes `description`, `required_role`, params and output schemas |
+| `role.create` / `.update` / `.delete`   | `manage_roles` (or owner). Capabilities are bounded by the no-escalation rule |
+| `role.grant` / `.revoke`                | `manage_roles` (or owner). `agent_id` may be `'*'` for wildcard membership    |
+| `role.list` / `.get`                    | anyone who can see the namespace                                              |
+| `role.list_members`                     | `manage_roles` (or owner)                                                     |
+| `role.list_my_roles`                    | the caller themselves                                                         |
+| `audit.read` / `.head` / `.verify`      | `manage_roles` (or owner)                                                     |
+| `tx.invoke`                             | caller must hold the transition's `required_role` (or be owner)               |
+| `doc.get`                               | `read` capability matching the path; response includes the bound `schema_dsl` |
+| `log.read` / `log.head`                 | `read` capability matching the log id; response includes the bound `schema_dsl` |
+| `counter.get` / `lock.inspect`          | `read` capability matching the path                                           |
+| `blob.put` / `blob.get` / `blob.exists` | `manage_roles` (or owner)                                                     |
+
+Authorization logic lives in `src/core/capabilities.ts`. Capabilities are resolved per request (no session caching), so revocations take effect on the very next call.
 
 ---
 
@@ -234,8 +226,8 @@ Tests inject safe env defaults via `tests/setup.ts` (including `ALLOW_DEV_AGENT_
 src/
   auth/        # dev-auth middleware (JWT path TODO)
   config.ts    # env schema; single source of truth
-  control/     # namespace/schema/transition/policy/admin/capability CRUD + audit
-  core/        # primitives (doc, log, counter, lock, blob, audit, capability checks)
+  control/     # namespace/schema/transition/role CRUD + audit
+  core/        # primitives (doc, log, counter, lock, blob, audit, role-based capability checks)
     transition/  # grammar, registry, substitute, asserts, ops, invoke
   http/        # Hono app (/healthz, /mcp)
   mcp/         # MCP server assembly, tool registrations, ALS context carrier
@@ -254,4 +246,4 @@ src/
 - [ ] Rate limiting middleware (including per-IP cap on `/enroll` and `/enroll/claim`)
 - [ ] `log.tail` (LISTEN/NOTIFY server → client streaming)
 - [ ] Prometheus `/metrics` endpoint
-- [ ] `POLICY.register` API (the evaluator is implemented; the policy-rule registration surface is not yet exposed)
+- [ ] Agent-initiated `role.request_membership` flow (currently membership grants are operator-driven via `role.grant`)

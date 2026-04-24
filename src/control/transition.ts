@@ -2,7 +2,7 @@ import type { Kysely } from "kysely";
 import type { Database, JsonValue } from "../storage/postgres/schema.js";
 import { LedgerError } from "../core/errors.js";
 import { appendAudit } from "../core/audit.js";
-import { requireAdmin } from "../core/capabilities.js";
+import { requireManageRoles } from "../core/capabilities.js";
 import {
   parseTransitionDefinition,
   type Assert,
@@ -11,12 +11,14 @@ import {
 } from "../core/transition/grammar.js";
 import type { SchemaDsl } from "../core/schema.js";
 
-// Control-plane wrapper around core/transition/registry. Enforces admin
-// capability, immutability, and emits audit entries in the same tx as the
-// mutation (I29). Use this in place of registerTransition/deprecateTransition
-// from core/transition/registry when an actor agent is known.
+// Control-plane wrapper around core/transition/registry. Enforces the
+// manage_roles capability (or owner), immutability, and emits an audit entry
+// in the same tx as the mutation (I29). Persists the new self-describing
+// metadata: `description` (free text) and `required_role` (the role name an
+// agent must hold to invoke this transition; null = owner-only).
 
 const NAME_RE = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
+const MAX_DESCRIPTION_BYTES = 4096;
 
 export async function registerTransition(
   db: Kysely<Database>,
@@ -29,9 +31,11 @@ export async function registerTransition(
     params_schema: unknown;
     asserts: unknown;
     ops: unknown;
+    description: string;
+    required_role: string | null;
   },
 ): Promise<void> {
-  await requireAdmin(db, input.namespaceId, input.actorAgentId);
+  await requireManageRoles(db, input.namespaceId, input.actorAgentId);
   if (!NAME_RE.test(input.name)) {
     throw new LedgerError("invalid_params",
       "transition name must match /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/");
@@ -39,11 +43,38 @@ export async function registerTransition(
   if (!Number.isInteger(input.version) || input.version < 1) {
     throw new LedgerError("invalid_params", "transition version must be a positive integer");
   }
+  if (typeof input.description !== "string") {
+    throw new LedgerError("invalid_params", "transition description must be a string");
+  }
+  if (Buffer.byteLength(input.description, "utf8") > MAX_DESCRIPTION_BYTES) {
+    throw new LedgerError("invalid_params",
+      `transition description exceeds ${MAX_DESCRIPTION_BYTES} bytes`);
+  }
+  if (input.required_role !== null && !NAME_RE.test(input.required_role)) {
+    throw new LedgerError("invalid_params",
+      "required_role must be null or match /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/");
+  }
   const def = parseTransitionDefinition({
     params_schema: input.params_schema,
     asserts: input.asserts,
     ops: input.ops,
   });
+
+  // If a required_role is supplied it must reference an existing role in this
+  // namespace at registration time. We do NOT add a FK so historical
+  // transitions remain queryable after a role is later renamed/deleted.
+  if (input.required_role !== null) {
+    const role = await db
+      .selectFrom("roles")
+      .select("id")
+      .where("namespace_id", "=", input.namespaceId)
+      .where("name", "=", input.required_role)
+      .executeTakeFirst();
+    if (!role) {
+      throw new LedgerError("not_found",
+        `required_role '${input.required_role}' does not exist in namespace`);
+    }
+  }
 
   await db.transaction().execute(async (tx) => {
     const existing = await tx
@@ -66,6 +97,8 @@ export async function registerTransition(
         params_schema: JSON.stringify(def.params_schema as unknown as JsonValue),
         asserts: JSON.stringify(def.asserts as unknown as JsonValue),
         ops: JSON.stringify(def.ops as unknown as JsonValue),
+        description: input.description,
+        required_role: input.required_role,
         registered_by: input.actorAgentId,
       })
       .execute();
@@ -76,7 +109,11 @@ export async function registerTransition(
       requestId: input.requestId,
       plane: "control",
       kind: "transition.register",
-      payload: { name: input.name, version: input.version },
+      payload: {
+        name: input.name,
+        version: input.version,
+        required_role: input.required_role,
+      },
     });
   });
 }
@@ -91,7 +128,7 @@ export async function deprecateTransition(
     version: number;
   },
 ): Promise<void> {
-  await requireAdmin(db, input.namespaceId, input.actorAgentId);
+  await requireManageRoles(db, input.namespaceId, input.actorAgentId);
   await db.transaction().execute(async (tx) => {
     const res = await tx
       .updateTable("transitions")
@@ -120,6 +157,8 @@ export async function deprecateTransition(
 export interface TransitionDetail {
   name: string;
   version: number;
+  description: string;
+  required_role: string | null;
   deprecated: boolean;
   registered_at: Date;
   registered_by: string;
@@ -145,6 +184,8 @@ export async function getTransition(
   return {
     name: row.name,
     version: row.version,
+    description: row.description,
+    required_role: row.required_role,
     deprecated: row.deprecated_at !== null,
     registered_at: row.registered_at,
     registered_by: row.registered_by,

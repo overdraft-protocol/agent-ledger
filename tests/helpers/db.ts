@@ -111,9 +111,61 @@ export async function truncateAll(db: Kysely<Database>): Promise<void> {
       idempotency, rate_buckets,
       locks, blob_refs, blobs,
       counters, log_entries, logs, docs,
-      policies, transitions, schemas,
+      transitions, schemas,
+      role_members, role_capabilities, roles,
       enrollment_requests,
-      capabilities, admins, namespaces, agents
+      namespaces, agents
     RESTART IDENTITY CASCADE
   `.execute(db);
+}
+
+// Test helper: convenience wrapper that creates a role and grants it to an
+// agent (or '*'). Bypasses the manage_roles gate by inserting directly.
+export async function seedRole(
+  db: Kysely<Database>,
+  input: {
+    namespaceId: string;
+    createdBy: string;
+    name: string;
+    description?: string;
+    capabilities: Array<{
+      scope_kind: "read" | "invoke" | "manage_roles";
+      path_glob?: string | null;
+      transition_name?: string | null;
+    }>;
+    members?: Array<{ agentId: string; grantedBy: string }>;
+  },
+): Promise<{ roleId: string }> {
+  const role = await db
+    .insertInto("roles")
+    .values({
+      namespace_id: input.namespaceId,
+      name: input.name,
+      description: input.description ?? "",
+      created_by: input.createdBy,
+    })
+    .returning("id")
+    .executeTakeFirstOrThrow();
+  if (input.capabilities.length > 0) {
+    await db
+      .insertInto("role_capabilities")
+      .values(input.capabilities.map((c) => ({
+        role_id: role.id,
+        scope_kind: c.scope_kind,
+        path_glob: c.path_glob ?? null,
+        transition_name: c.transition_name ?? null,
+      })))
+      .execute();
+  }
+  for (const m of input.members ?? []) {
+    await db
+      .insertInto("role_members")
+      .values({
+        role_id: role.id,
+        agent_id: m.agentId,
+        granted_by: m.grantedBy,
+      })
+      .execute();
+  }
+  return { roleId: role.id };
 }

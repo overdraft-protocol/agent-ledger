@@ -25,12 +25,13 @@ export type JsonColumn = ColumnType<JsonValue, string, string>;
 export interface Database {
   agents: AgentsTable;
   namespaces: NamespacesTable;
-  admins: AdminsTable;
-  capabilities: CapabilitiesTable;
+
+  roles: RolesTable;
+  role_capabilities: RoleCapabilitiesTable;
+  role_members: RoleMembersTable;
 
   schemas: SchemasTable;
   transitions: TransitionsTable;
-  policies: PoliciesTable;
 
   docs: DocsTable;
   logs: LogsTable;
@@ -69,23 +70,32 @@ export interface NamespacesTable {
   tombstoned_at: Timestamp | null;
 }
 
-export interface AdminsTable {
-  namespace_id: string;
-  agent_id: string;
-  granted_by: string;
-  granted_at: Generated<Timestamp>;
-}
+// ---------- Roles & RBAC ----------
 
-export interface CapabilitiesTable {
+export type RoleScopeKind = "read" | "invoke" | "manage_roles";
+
+export interface RolesTable {
   id: Generated<string>;
   namespace_id: string;
-  agent_id: string;
-  scope_kind: "read" | "invoke";
+  name: string;
+  description: Generated<string>;
+  created_at: Generated<Timestamp>;
+  created_by: string;
+}
+
+export interface RoleCapabilitiesTable {
+  id: Generated<string>;
+  role_id: string;
+  scope_kind: RoleScopeKind;
   path_glob: string | null;
   transition_name: string | null;
+}
+
+export interface RoleMembersTable {
+  role_id: string;
+  agent_id: string; // uuid text or '*' wildcard
   granted_by: string;
   granted_at: Generated<Timestamp>;
-  expires_at: Timestamp | null;
 }
 
 // ---------- Control plane ----------
@@ -108,17 +118,11 @@ export interface TransitionsTable {
   params_schema: JsonColumn;
   asserts: JsonColumn;
   ops: JsonColumn;
+  description: Generated<string>;
+  required_role: string | null;
   registered_at: Generated<Timestamp>;
   registered_by: string;
   deprecated_at: Timestamp | null;
-}
-
-export interface PoliciesTable {
-  namespace_id: string;
-  id: Generated<string>;
-  rule: JsonColumn;
-  updated_at: Generated<Timestamp>;
-  updated_by: string;
 }
 
 // ---------- Data plane ----------

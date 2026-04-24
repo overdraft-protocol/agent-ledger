@@ -20,6 +20,8 @@ export interface RegisteredTransition {
   namespace_id: string;
   name: string;
   version: number;
+  description: string;
+  required_role: string | null;
   def: TransitionDefinition;
   deprecated: boolean;
 }
@@ -34,6 +36,8 @@ export async function registerTransition(
     params_schema: unknown;
     asserts: unknown;
     ops: unknown;
+    description?: string;
+    required_role?: string | null;
   },
 ): Promise<void> {
   if (!NAME_RE.test(input.name)) {
@@ -70,6 +74,8 @@ export async function registerTransition(
       params_schema: JSON.stringify(def.params_schema as unknown as JsonValue),
       asserts: JSON.stringify(def.asserts as unknown as JsonValue),
       ops: JSON.stringify(def.ops as unknown as JsonValue),
+      description: input.description ?? "",
+      required_role: input.required_role ?? null,
       registered_by: input.registeredBy,
     })
     .execute();
@@ -106,7 +112,10 @@ export async function loadTransition(
 ): Promise<RegisteredTransition> {
   let q = db
     .selectFrom("transitions")
-    .select(["name", "version", "params_schema", "asserts", "ops", "deprecated_at"])
+    .select([
+      "name", "version", "params_schema", "asserts", "ops",
+      "description", "required_role", "deprecated_at",
+    ])
     .where("namespace_id", "=", namespaceId)
     .where("name", "=", name);
 
@@ -130,6 +139,8 @@ export async function loadTransition(
     namespace_id: namespaceId,
     name: row.name,
     version: row.version,
+    description: row.description,
+    required_role: row.required_role,
     deprecated: row.deprecated_at !== null,
     def: {
       params_schema: row.params_schema as unknown as SchemaDsl,
@@ -143,16 +154,24 @@ export async function listTransitions(
   db: Kysely<Database>,
   namespaceId: string,
   includeDeprecated: boolean,
-): Promise<Array<{ name: string; version: number; deprecated: boolean }>> {
+): Promise<Array<{
+  name: string;
+  version: number;
+  description: string;
+  required_role: string | null;
+  deprecated: boolean;
+}>> {
   let q = db
     .selectFrom("transitions")
-    .select(["name", "version", "deprecated_at"])
+    .select(["name", "version", "description", "required_role", "deprecated_at"])
     .where("namespace_id", "=", namespaceId);
   if (!includeDeprecated) q = q.where("deprecated_at", "is", null);
   const rows = await q.orderBy("name", "asc").orderBy("version", "asc").execute();
   return rows.map((r) => ({
     name: r.name,
     version: r.version,
+    description: r.description,
+    required_role: r.required_role,
     deprecated: r.deprecated_at !== null,
   }));
 }

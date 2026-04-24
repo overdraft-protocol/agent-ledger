@@ -46,14 +46,23 @@ export async function listNamespacesForAgent(
   db: Kysely<Database>,
   agentId: string,
 ): Promise<Namespace[]> {
-  // Owner + admin — everything the agent can administer.
+  // Owner + any namespace where the caller (or wildcard) holds at least one
+  // role. Includes namespaces where the caller is a guest via '*'.
   return await db
     .selectFrom("namespaces")
     .selectAll()
     .where((eb) =>
       eb.or([
         eb("owner_agent_id", "=", agentId),
-        eb("id", "in", eb.selectFrom("admins").select("namespace_id").where("agent_id", "=", agentId)),
+        eb(
+          "id",
+          "in",
+          eb
+            .selectFrom("role_members as rm")
+            .innerJoin("roles as r", "r.id", "rm.role_id")
+            .select("r.namespace_id")
+            .where((eb2) => eb2.or([eb2("rm.agent_id", "=", agentId), eb2("rm.agent_id", "=", "*")])),
+        ),
       ]),
     )
     .orderBy("created_at", "asc")

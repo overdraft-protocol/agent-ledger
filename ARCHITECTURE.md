@@ -2,7 +2,7 @@
 
 ## One-line model
 
-> **agent-ledger is a programmable, capability-secured, append-only datastore where protocols are declared as tuples of (schemas, transitions, policies) in hermetic namespaces. Data-plane state changes happen only through transitions. This makes a protocol's public interface exactly its transition set, and makes the server the sole enforcer of every behavioral invariant the protocol declares.**
+> **agent-ledger is a programmable, role-gated, append-only datastore where protocols are declared as tuples of (schemas, transitions, roles) in hermetic namespaces. Data-plane state changes happen only through transitions, and every transition declares the role required to invoke it. This makes a protocol's public interface exactly its transition set, and makes the server the sole enforcer of every behavioral invariant the protocol declares.**
 
 Everything that follows is the precise unfolding of that sentence.
 
@@ -33,8 +33,8 @@ Everything that follows is the precise unfolding of that sentence.
 ## Design principles
 
 1. **Unopinionated about protocols, opinionated about safety.** The server takes no position on what a protocol means. It takes strong positions on how data is validated, who may access it, and how transitions are composed.
-2. **One mutation path.** All data-plane state changes happen through transitions. No tier bypasses, no escape hatches, no two-channel state change.
-3. **Secure by default.** Where a default must be chosen, the choice is the one that fails closed. Raw primitive writes are refused universally; capabilities are grants, not defaults; audit is always on.
+2. **One mutation path.** All data-plane state changes happen through transitions. No role bypasses, no escape hatches, no two-channel state change.
+3. **Secure by default.** Where a default must be chosen, the choice is the one that fails closed. Raw primitive writes are refused universally; capabilities are granted via roles, not defaults; audit is always on.
 4. **Declarative over procedural.** Schemas, transitions, and policies are declarative rules stored in the namespace. No stored procedures, no server-side computation beyond parameter substitution.
 5. **Hermetic namespaces.** A namespace is a trust boundary. No cross-namespace reads, no cross-namespace schema references, no ambient authority.
 6. **Capabilities, not ACLs.** Authority is the possession of an unforgeable token naming a specific scope. Checks are local; there is no global identity oracle.
@@ -70,7 +70,7 @@ Transitions correspond to the ~85% of deployed smart contracts that actually do 
 | Solidity artifact | agent-ledger equivalent |
 |---|---|
 | `struct` / storage layout | Schemas |
-| Access modifiers (`onlyOwner`, role checks) | Policies |
+| Access modifiers (`onlyOwner`, role checks) | Roles + `required_role` on transitions |
 | Method bodies with `require(...)` | Transitions |
 | `event` emission | Audit log entries |
 
@@ -86,15 +86,15 @@ Used consistently throughout the system, code, and documentation.
 | **Transition** | A namespace-registered, parameterized, atomic, declaratively-specified state change. The public mutation interface of a protocol. |
 | **Invocation** | A concrete call of a transition with concrete parameters by a specific agent. The unit of data-plane audit log entry. |
 | **Command** | Any request an agent issues to the server. Covers reads, invocations, and control-plane operations. |
-| **Schema** | A namespace-registered Zod definition with structural and cross-field constraints, exported to JSON Schema for the wire. |
-| **Policy** | A namespace-registered rule governing read capability, invoke capability, and rate limits per path or per transition. |
-| **Protocol** | The tuple `(Namespace, Schemas, Transitions, Policies)`. A fully declarative, inspectable, verifiable specification. |
+| **Schema** | A namespace-registered, immutable typed-primitive definition (DSL), used internally by transitions and surfaced inlined in read responses. |
+| **Protocol** | The tuple `(Namespace, Schemas, Transitions, Roles)`. A fully declarative, inspectable, verifiable specification. |
 | **Namespace** | The unit of isolation, ownership, and trust. Hermetic. |
-| **Capability** | An unforgeable grant recording `(agent_id, namespace, scope)`. The basis of all authorization. |
-| **Agent** | An identity holding capabilities. Maps 1:1 with an OAuth subject. |
-| **Owner** | The unique, immutable tier-0 agent of a namespace. |
-| **Admin** | A tier-1 agent; elevated by owner, revocable by owner. |
-| **Control plane** | Operations that mutate the namespace's rule set: schemas, transitions, policies, capabilities, agents, namespaces themselves. |
+| **Role** | A named, namespace-scoped bundle of capabilities. Agents become role members (directly, or via wildcard `*`) and inherit those capabilities. |
+| **Capability** | One row of `(scope_kind, path_glob | transition_name)` attached to a role. Three kinds: `read`, `invoke`, `manage_roles`. |
+| **Required role** | A field on each transition naming the role an agent must hold to invoke it (`null` = owner-only). The transition's public access contract. |
+| **Agent** | An identity holding zero or more roles. Maps 1:1 with an OAuth subject. |
+| **Owner** | The unique, immutable agent of a namespace. Holds implicit, unrevokable full access. |
+| **Control plane** | Operations that mutate the namespace's rule set: schemas, transitions, roles, role memberships, agents, namespaces themselves. |
 | **Data plane** | Operations that mutate protocol state: docs, logs, counters, blobs, locks. Mutations exclusively via transitions. |
 
 ---
@@ -107,13 +107,11 @@ The system is split into two architecturally distinct planes. This split resolve
 
 Operations that mutate a namespace's rule set and governance. Direct, capability-gated API. Finite, fixed set — not extensible by users.
 
-- `schema.register`, `schema.deprecate`, `schema.get`, `schema.list`
+- `schema.register`, `schema.deprecate`, `schema.validate` (schemas are an internal artifact; agents see them inlined in `transition.get` / `doc.get` / `log.read`)
 - `transition.register`, `transition.deprecate`, `transition.get`, `transition.list`
-- `policy.set`, `policy.get`, `policy.test`
-- `cap.grant`, `cap.revoke`, `cap.list`
-- `admin.grant`, `admin.revoke` (owner only)
-- `namespace.create`, `namespace.describe`, `namespace.list`, `namespace.tombstone`, `namespace.purge` (purge: owner only; 24 h cooldown after tombstone)
-- `agent.get_self`, `agent.describe`
+- `role.create`, `role.update`, `role.delete`, `role.get`, `role.list`, `role.grant`, `role.revoke`, `role.list_members`, `role.list_my_roles`
+- `namespace.create`, `namespace.search`, `namespace.list`, `namespace.tombstone`
+- `audit.read`, `audit.head`, `audit.verify`
 
 All control-plane operations are audited identically to data-plane operations: they produce hash-chained audit entries. Control-plane operations are how the protocol itself evolves; that evolution must be visible.
 
@@ -172,8 +170,8 @@ Zod definition + JSON Schema export. Immutable from the instant of registration 
 #### `transition`
 See [Transitions](#transitions). Immutable on registration; new version = new registration. Deprecation marks as "no new invocations" but does not retroactively invalidate existing audit entries.
 
-#### `policy`
-Per-path / per-transition rules governing read capability, invoke capability, and rate limits. Stored as JSON, evaluated by a single function used by both `policy.test` and the runtime enforcement middleware.
+#### `role`
+A namespace-scoped, named bundle of capabilities. Memberships record `(role_id, agent_id, granted_by, granted_at)`. The agent_id may be a UUID (direct grant) or `'*'` (wildcard — every authenticated agent). Roles are mutable: capabilities can be added or removed by any holder of `manage_roles`, subject to the no-escalation rule.
 
 ### Internal: `audit`
 Always-on, hash-chained, per-namespace. One row per control-plane or data-plane mutation, written in the same transaction as the mutation. Read via `audit.read(from, limit)` and `audit.verify(range)`. Exposes `audit.head(namespace)` for external anchoring. Partitioned by month.
@@ -185,21 +183,22 @@ Always-on, hash-chained, per-namespace. One row per control-plane or data-plane 
 A protocol is declared as:
 
 ```
-Protocol := (Namespace, Schemas, Transitions, Policies)
+Protocol := (Namespace, Schemas, Transitions, Roles)
 ```
 
-All four parts live in the namespace, are registered via control-plane operations, and are discoverable by any agent with `read` capability on the namespace.
+All four parts live in the namespace and are registered via control-plane operations. Transitions and roles are publicly discoverable to anyone who can see the namespace; schemas are inlined into the responses that need them rather than exposed as a separate surface.
 
 ### Interaction model
 
-- Agents read via direct primitive calls (capability-gated).
-- Agents mutate state via `tx.invoke(transition, params)`. There is no other way.
-- Agents discover a protocol's interface via `schema.list`, `transition.list`, `policy.get`.
-- Agents verify a protocol's history via `audit.read` and `audit.verify`.
+- Agents discover protocols across the ledger via `namespace.search` (or `namespace.list` for ones they already participate in).
+- Agents discover a namespace's public interface via `transition.list` / `transition.get` (each transition advertises its `description`, `required_role`, params schema, and output schemas) and `role.list` / `role.get` (the bundle of capabilities each role confers).
+- Agents read state via direct primitive calls (`doc.get`, `log.read`, `counter.get`, …) — gated by `read` capabilities held through their roles.
+- Agents mutate state via `tx.invoke(transition, params)`. There is no other way. Invocation is gated by the transition's `required_role`.
+- Agents verify a protocol's history via `audit.read` and `audit.verify` (gated by `manage_roles`).
 
 ### Composition across protocols (hermetic boundary)
 
-Namespaces are hermetic. A protocol in namespace A cannot read, reference, or trust anything in namespace B directly. Protocols that interoperate do so via a **bridge agent** holding capabilities in both namespaces. The bridge is the only trust edge; both namespaces log its activity.
+Namespaces are hermetic. A protocol in namespace A cannot read, reference, or trust anything in namespace B directly. Protocols that interoperate do so via a **bridge agent** holding roles in both namespaces. The bridge is the only trust edge; both namespaces log its activity.
 
 This is the only approved cross-namespace pattern.
 
@@ -272,7 +271,7 @@ Transitions cannot call other transitions. If you need to compose, write one lar
 
 ### Registration and immutability
 
-- `transition.register` requires admin.
+- `transition.register` requires `manage_roles` (or owner). The caller supplies `description` (free text shown to discoverers) and `required_role` (the role name an invoker must hold; `null` = owner-only). If non-null, the role must already exist in the namespace.
 - Transitions are immutable on registration. Re-registering a name is an error.
 - New behavior → new name or explicit version suffix.
 - `transition.deprecate` marks a transition as unavailable for new invocations but preserves its definition for audit log interpretability.
@@ -281,70 +280,85 @@ Transitions cannot call other transitions. If you need to compose, write one lar
 
 ## Ownership and capabilities
 
-### Three tiers
+### Two fixed primitives, everything else is a role
+
+The model has exactly two principals the system itself understands:
 
 ```
-                    ┌──────────┐
-                    │  Owner   │    Tier 0 — immutable, unique per ns
-                    └────┬─────┘
-                         │  admin.grant / admin.revoke
-                         ▼
-                    ┌──────────┐
-                    │  Admin   │    Tier 1 — owner-granted, owner-revocable
-                    └────┬─────┘
-                         │  cap.grant (path-scoped, non-wildcard)
-                         ▼
-                    ┌──────────┐
-                    │  Agent   │    Tier 2 — holders of operational capabilities
-                    └──────────┘
+                ┌──────────┐
+                │  Owner   │   one per namespace, immutable, full implicit access
+                └────┬─────┘
+                     │  creates roles, grants the first manage_roles
+                     ▼
+                ┌──────────┐
+                │  Roles   │   user-defined named bundles of capabilities
+                └────┬─────┘
+                     │  role.grant (agent_id = uuid OR '*')
+                     ▼
+                ┌──────────┐
+                │  Agents  │   inherit capabilities from every role they hold
+                └──────────┘
 ```
 
-### Tier 0 — Owner
+There is no built-in "admin" tier. A namespace can absolutely have an *admin* role — but it is created by the owner like any other role and gains its powers from the capabilities the owner attaches. A namespace can also have no `manage_roles` holders at all if the owner prefers to retain sole control.
 
-Immutable, unique, unrevokable. Holds the full Tier 1 capability set plus three meta-capabilities that exist nowhere else:
+### Owner
 
-- `admin.grant`
-- `admin.revoke`
-- `namespace.purge`
+Unique per namespace, recorded on `namespaces.owner_agent_id`. Unrevokable. The owner check is the first branch of every gate (`canRead`, `canInvoke`, `requireManageRoles`, `requireCanInvokeAsRequiredRole`) — owner can never be locked out by role gymnastics, and `loadAgentCapabilities` synthesises a maximal capability set for the owner so the no-escalation rule works uniformly.
 
-Owner's agent record cannot be deleted while any namespace back-references it (enforced by FK).
+### Roles
 
-### Tier 1 — Admin
+A role is a `(namespace_id, name, description)` row with attached capabilities and members. Three capability kinds exist:
 
-Grantable by owner, revocable by owner. Cannot grant admin (no transitive elevation). Admins hold:
+| Kind | Shape | Effect |
+|---|---|---|
+| `read` | `path_glob` | Authorises `doc.get`/`log.read`/`counter.get`/`lock.inspect` whose path matches the glob. |
+| `invoke` | `transition_name` (or `'*'`) | Authorises `tx.invoke` of that transition (or any transition, with `'*'`). Independent of `required_role` gating — see below. |
+| `manage_roles` | (no scope arguments) | Permits the holder to create / update / delete roles, grant / revoke memberships, register / deprecate schemas and transitions, and read the audit log. |
 
-- All control-plane operations except `admin.grant`/`admin.revoke`/`namespace.purge`
-- Implicit read/write access to the entire namespace *for invoking transitions* — but admins still invoke via transitions like everyone else
-- `cap.grant` / `cap.revoke` restricted to non-admin capabilities with path globs that are not namespace-wide wildcards
+Membership has two flavours:
 
-Admin is a role flag on `(agent_id, namespace_id)`, not a capability bundle. Admin cannot be assembled by accumulating fine-grained capabilities.
+- **Direct.** `role_members.agent_id = <agent uuid>`.
+- **Wildcard.** `role_members.agent_id = '*'`. Every authenticated agent is treated as a member of that role. This is the single mechanism used for guest tiers, open protocols, and "anyone can request to join"-style onboarding. There is no separate `open: bool` flag on protocols.
 
-### Tier 2 — Operational agents
+### `required_role` on transitions
 
-Hold zero or more capabilities per namespace. Each capability is a record:
+Each transition declares a `required_role: string | null` field (alongside `description`, `params_schema`, `asserts`, `ops`). At `tx.invoke` time the server resolves the active transition row, then enforces:
 
-```
-{
-  agent_id, namespace_id,
-  scope: {
-    kind: "read" | "invoke",
-    path_glob? (for read),
-    transition_name? (for invoke)
-  },
-  granted_by, granted_at,
-  expires_at?
-}
-```
+- `required_role = null` → only the namespace owner may invoke.
+- `required_role = "<name>"` → the caller must be the owner OR hold a role with that name in the same namespace.
 
-Reads are path-scoped. Invocations are transition-scoped. An agent invokes a transition only if they hold an `invoke` capability for that transition; the transition's own asserts may then further restrict via `capability.holds` checks on specific paths.
+This check is intentionally orthogonal to the `invoke` capability scope: agents discover what role they need by reading `transition.get`, then ask a `manage_roles` holder to grant them that role. The `invoke` capability scope still exists, but it is consulted by the lower-level `requireInvoke` helper used by direct primitive operations rather than by the discovery-friendly `tx.invoke` path. This preserves the property that *the access contract of a transition is part of its public interface*.
+
+### The `manage_roles` meta-capability and no-escalation
+
+`manage_roles` is the seed of all delegated administration. Holders may:
+
+- create / update / delete roles
+- grant / revoke role memberships
+- register / deprecate schemas and transitions
+- read and verify the audit chain
+
+It is the only meta-capability — there is nothing equivalent to "admin.grant admin". Delegation is bounded by the **no-escalation rule**, enforced in `assertCapsSubset`:
+
+> Every capability a `manage_roles` holder writes into a role (via `role.create` or `role.update`) must already be covered by a capability they themselves hold today.
+
+"Covered" is defined by `capCovers`:
+
+- `manage_roles` covers `manage_roles`.
+- `invoke:*` covers `invoke:<anything>`; otherwise exact match on `transition_name`.
+- `read` is exact glob match, plus `**` covers everything, plus `<prefix>/**` covers itself and any path strictly under `<prefix>/`. No deeper glob algebra (anything subtler is a recipe for subtle privilege leaks).
+
+The owner's synthesised capability set (`read:**`, `invoke:*`, `manage_roles`) means the owner can always grant any capability. Delegated `manage_roles` holders cannot bootstrap their way into capabilities their grantor never permitted.
 
 ### Grant invariants
 
-- Only admin and owner may grant.
-- Admin cannot grant admin (single-source elevation; no transitivity).
-- Grants of namespace-wide wildcard path globs (`**`) are refused for non-admin capabilities.
-- Every grant records `granted_by` and `granted_at` for audit and cascade-revocation.
-- Revocation of an admin does not auto-cascade that admin's prior grants. Owners use `cap.list(granted_by: <agent>)` + `cap.revoke_bulk` as a deliberate recovery action.
+- Only the owner or a `manage_roles` holder may create roles or grant memberships.
+- The no-escalation rule applies on every `role.create` and `role.update`.
+- Namespace-wide read globs (anything that matches `**` or `*`) cannot be granted into a role — `validateRoleCapability` refuses them. Owner read remains unconstrained because the owner does not go through the role plane.
+- Every membership records `granted_by` and `granted_at` for audit.
+- Deletion of a role is refused while any *non-deprecated* transition still names it as `required_role` — the system treats `required_role` as a soft reference (no FK) so historical transitions remain readable after a role is later removed, but the live access contract cannot dangle.
+- Revoking a `manage_roles` membership does not cascade their prior grants: a deliberate `role.list_members` / `role.revoke` sweep is required if you want to undo their work.
 
 ---
 
@@ -829,12 +843,13 @@ Explicit list so contributors don't re-derive these decisions.
 ### Create a new protocol
 
 1. Authenticate as the intended owner.
-2. `namespace.create({alias: "<name>"})` → returns `namespace_id`.
-3. `schema.register` each schema the protocol needs.
-4. `transition.register` each transition.
-5. `policy.set` for reads and invoke permissions.
-6. `cap.grant` to the agents that will participate.
-7. Publish the protocol's namespace ID; other agents can `schema.list`, `transition.list`, `policy.get` to discover the interface.
+2. `namespace.create({alias: "<name>"})` → returns `namespace_id`. The caller becomes the owner; no other roles are auto-created.
+3. (Optional but usual) `role.create({ name: "admin", capabilities: [{ kind: "manage_roles" }] })` if you intend to delegate administration.
+4. `role.create({ name: "<member-role>", capabilities: [{ kind: "invoke", transition_name: "<tx>" }, ...] })` for each access tier the protocol needs. For an open / "anyone may participate" protocol, set the role's capabilities and grant it with `agent_id: '*'`.
+5. `schema.register` each schema the protocol needs (internal artifact).
+6. `transition.register` each transition, supplying `description` and `required_role`. The role must already exist.
+7. `role.grant({ role: "<member-role>", agent_id: <agent-uuid-or-'*'> })` to enrol participants.
+8. Publish the namespace ID. Other agents can run `transition.list` / `transition.get` to discover the public interface and the role they need.
 
 ### Backup and restore
 
@@ -870,11 +885,11 @@ To revoke a specific token immediately:
 1. Call Hydra's revocation endpoint for the JTI.
 2. The in-process blocklist picks up the revocation within 10 s.
 
-To revoke a compromised admin and their grants:
+To revoke a compromised role-administrator and their grants:
 
-1. `admin.revoke(agent_id)` (owner only).
-2. `cap.list({granted_by: agent_id})` → review.
-3. `cap.revoke_bulk({granted_by: agent_id})` if cascade is required.
+1. `role.revoke({ role: "<role-they-held>", agent_id: <attacker-id> })` for every administrative role they hold (owner or any other `manage_roles` holder may run this).
+2. For each role they could plausibly have created or granted, run `role.list_members({ role })` and `role.revoke` any membership entries with `granted_by = <attacker-id>` that you wish to undo. There is no automatic cascade — this is a deliberate recovery action.
+3. `audit.read` to enumerate every control-plane action they performed and decide whether further unwinding is required.
 
 ### Graceful shutdown
 
