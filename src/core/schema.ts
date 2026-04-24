@@ -81,14 +81,156 @@ function dslDepth(s: Dsl, acc = 0): number {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Input normalisation — runs BEFORE DslSchema.safeParse so agents can use
+// the more natural syntax they already know from JSON Schema / Zod:
+//
+//   "properties" accepted as an alias for "props"
+//   "extras" defaults to "strip" when omitted on object nodes
+//   flat prop values  { t: "string", optional?: true }
+//     accepted alongside legacy wrapped  { s: { t: "string" }, optional?: true }
+//
+// The canonical stored form is always the legacy wrapped format; normalisation
+// is input-only and backward-compatible with existing stored schemas.
+// ---------------------------------------------------------------------------
+
+function preprocessDsl(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+
+  const obj = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...obj };
+
+  // "properties" → "props" alias
+  if ("properties" in out && !("props" in out)) {
+    out["props"] = out["properties"];
+    delete out["properties"];
+  }
+
+  // Default "extras" on object nodes
+  if (out["t"] === "object" && !("extras" in out)) {
+    out["extras"] = "strip";
+  }
+
+  // Normalise object props: flat { t, optional? } → wrapped { s, optional? }
+  if (
+    out["t"] === "object" &&
+    typeof out["props"] === "object" &&
+    out["props"] !== null &&
+    !Array.isArray(out["props"])
+  ) {
+    const rawProps = out["props"] as Record<string, unknown>;
+    const newProps: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rawProps)) {
+      if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+        const pv = v as Record<string, unknown>;
+        if (!("s" in pv) && "t" in pv) {
+          // Flat format — extract optional, recursively preprocess the rest
+          const optional = pv["optional"];
+          const schemaFields: Record<string, unknown> = {};
+          for (const [fk, fv] of Object.entries(pv)) {
+            if (fk !== "optional") schemaFields[fk] = fv;
+          }
+          const inner = preprocessDsl(schemaFields);
+          if (optional !== undefined) {
+            newProps[k] = { s: inner, optional };
+          } else {
+            newProps[k] = { s: inner };
+          }
+        } else if ("s" in pv) {
+          // Wrapped format — recurse into inner schema only
+          newProps[k] = { ...pv, s: preprocessDsl(pv["s"]) };
+        } else {
+          newProps[k] = preprocessDsl(v);
+        }
+      } else {
+        newProps[k] = v;
+      }
+    }
+    out["props"] = newProps;
+  }
+
+  // Recurse into composite type fields
+  if ("items" in out) out["items"] = preprocessDsl(out["items"]);
+  if (Array.isArray(out["options"])) {
+    out["options"] = (out["options"] as unknown[]).map(preprocessDsl);
+  }
+  if ("of" in out) out["of"] = preprocessDsl(out["of"]);
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Targeted error hints — called with the *original* raw input (pre-normalise)
+// so we can diagnose what the agent actually wrote.
+// ---------------------------------------------------------------------------
+
+const VALID_DSL_TYPES = new Set([
+  "string", "int", "number", "bool", "null", "literal",
+  "enum", "array", "object", "union", "blobref", "index",
+]);
+
+function dslErrorHint(raw: unknown, error: z.ZodError): string {
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    const t = obj["t"];
+
+    if (t === undefined) {
+      return (
+        `missing required field "t". Every schema node needs a "t" ` +
+        `discriminant, e.g. { "t": "string" } or { "t": "object", "props": { ... } }`
+      );
+    }
+    if (typeof t === "string" && !VALID_DSL_TYPES.has(t)) {
+      return (
+        `unknown type "${t}". Valid values for "t": ` +
+        [...VALID_DSL_TYPES].join(", ")
+      );
+    }
+    if (t === "object") {
+      const hasProps = "props" in obj || "properties" in obj;
+      if (!hasProps) {
+        return (
+          `t="object" requires a "props" field — an object mapping field names ` +
+          `to their schemas, e.g. { "t": "object", "props": { "name": { "t": "string" } } }`
+        );
+      }
+    }
+    if (t === "enum") {
+      const vs = obj["vs"];
+      if (!Array.isArray(vs) || vs.length === 0) {
+        return `t="enum" requires a non-empty "vs" array, e.g. { "t": "enum", "vs": ["a", "b"] }`;
+      }
+    }
+    if (t === "literal" && !("v" in obj)) {
+      return `t="literal" requires a "v" field, e.g. { "t": "literal", "v": "active" }`;
+    }
+    if (t === "array" && !("items" in obj)) {
+      return `t="array" requires an "items" schema, e.g. { "t": "array", "items": { "t": "string" } }`;
+    }
+    if (t === "union" && !("options" in obj)) {
+      return `t="union" requires an "options" array, e.g. { "t": "union", "options": [{ "t": "string" }, { "t": "null" }] }`;
+    }
+  }
+  // Generic fallback: first few Zod issue messages with paths
+  const items = error.issues.slice(0, 3).map((i) => {
+    const p = i.path.length ? i.path.join(".") : "root";
+    return `[${p}] ${i.message}`;
+  });
+  return items.join("; ");
+}
+
 export function parseSchemaDsl(raw: unknown): Dsl {
   const bytes = Buffer.byteLength(JSON.stringify(raw), "utf8");
   if (bytes > MAX_SCHEMA_BYTES) {
     throw new LedgerError("too_large", `schema exceeds ${MAX_SCHEMA_BYTES} bytes`);
   }
-  const parsed = DslSchema.safeParse(raw);
+  const normalized = preprocessDsl(raw);
+  const parsed = DslSchema.safeParse(normalized);
   if (!parsed.success) {
-    throw new LedgerError("schema_violation", "invalid schema DSL", { issues: parsed.error.issues });
+    const hint = dslErrorHint(raw, parsed.error);
+    throw new LedgerError("schema_violation", `invalid schema DSL: ${hint}`, {
+      issues: parsed.error.issues,
+    });
   }
   const depth = dslDepth(parsed.data);
   if (depth > MAX_SCHEMA_DEPTH) {

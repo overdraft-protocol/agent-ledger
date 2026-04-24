@@ -43,6 +43,8 @@ import {
   requireInvoke,
   requireAdmin,
 } from "../core/capabilities.js";
+import { parseSchemaDsl } from "../core/schema.js";
+import { LedgerError } from "../core/errors.js";
 import {
   readAudit,
   getAuditHead,
@@ -227,6 +229,31 @@ function registerSchemaTools(server: McpServer): void {
         version: args.version,
       });
       return { deprecated: true };
+    }),
+  );
+
+  server.registerTool(
+    "schema.validate",
+    {
+      description:
+        "Validate a schema DSL object without registering it. Use this to test your DSL before calling schema.register. Returns { valid: true } or { valid: false, error: string }. No namespace or capability required.",
+      inputSchema: { dsl: z.unknown() },
+    },
+    wrap("schema.validate", async (args) => {
+      try {
+        parseSchemaDsl(args.dsl);
+        return { valid: true };
+      } catch (e) {
+        if (e instanceof LedgerError) {
+          const result: { valid: false; error: string; details?: Record<string, unknown> } = {
+            valid: false,
+            error: e.message,
+          };
+          if (e.details !== undefined) result.details = e.details;
+          return result;
+        }
+        throw e;
+      }
     }),
   );
 }

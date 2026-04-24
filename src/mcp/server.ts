@@ -15,157 +15,156 @@ export function buildMcpServer(): McpServer {
         tools: {},
       },
       instructions: `\
-agent-ledger is a durable, audited state store. All mutations are atomic and run inside a serializable database transaction. Every call is capability-gated.
+agent-ledger: typed, atomic, audited state store. Every mutation runs in a SERIALIZABLE transaction.
 
-## Quick mental model
+## COMPLETE WORKED EXAMPLE — copy this pattern
 
-  Namespace  →  Schema definitions  →  Transition definitions  →  tx.invoke
-     |                                                                 |
-     └── Capability grants (read / invoke) control who can do what    └── Writes docs, logs, counters, locks
+Below is a full guestbook protocol. Walk through it to understand the shape of every call.
 
-A namespace is the top-level isolation boundary. Everything lives inside one.
-Schemas define the shape of data. Transitions define the mutations that can happen.
-Once you invoke a transition, docs/logs/counters are written atomically.
+### 1. Create a namespace (you become owner + implicit admin)
+namespace.create({ alias: "my-guestbook" })
+→ { id: "<NS_ID>", alias: "my-guestbook", owner_agent_id: "<YOUR_ID>" }
 
-## First-time setup (you own the namespace)
+### 2. Register a schema (defines what a guestbook entry looks like)
+schema.register({
+  namespace_id: "<NS_ID>",
+  name: "entry", version: 1,
+  dsl: {
+    "t": "object",
+    "props": {
+      "author":  { "t": "string", "max": 64 },
+      "message": { "t": "string", "max": 500 },
+      "mood":    { "t": "enum", "vs": ["happy","sad","excited"], "optional": true }
+    }
+  }
+})
+— Use schema.validate({ dsl: ... }) to test your DSL first without registering.
 
-1. namespace.create          — creates a namespace owned by you; you are implicitly admin
-2. schema.register           — register data shapes (see Schema DSL below)
-3. transition.register       — register named state-machine operations (see Transition Grammar below)
-4. tx.invoke                 — execute a transition atomically; you need an invoke capability first
-                               (as owner you can grant yourself one via capability.grant)
+### 3. Register transitions (the only way to mutate data)
 
-## Capability tiers
+3a. Init transition — creates the log (run once per namespace):
+transition.register({
+  namespace_id: "<NS_ID>",
+  name: "init_guestbook", version: 1,
+  params_schema: { "t": "object", "props": {} },
+  asserts: [],
+  ops: [{ "o": "log.create", "log_id": { "k": "lit", "v": "entries" }, "schema_name": "entry", "schema_version": 1 }]
+})
 
-  Owner   — the agent that created the namespace; can grant/revoke admins and capabilities
-  Admin   — can register schemas, transitions, policies; can grant/revoke read+invoke capabilities
-  Read    — can call doc.get, log.read/head, counter.get, lock.inspect on matching path globs
-  Invoke  — can call tx.invoke for a specific named transition
+3b. Write transition — appends a signed entry:
+transition.register({
+  namespace_id: "<NS_ID>",
+  name: "sign", version: 1,
+  params_schema: {
+    "t": "object",
+    "props": {
+      "author":  { "t": "string", "max": 64 },
+      "message": { "t": "string", "max": 500 }
+    }
+  },
+  asserts: [],
+  ops: [
+    { "o": "log.append",
+      "log_id": { "k": "lit", "v": "entries" },
+      "value":  { "k": "param", "name": "message" } }
+  ]
+})
 
-As namespace owner you start with full control. Grant yourself or others capabilities with capability.grant.
+### 4. Grant yourself capabilities (owner can always grant; data tools need explicit capability)
+capability.grant({ namespace_id: "<NS_ID>", agent_id: "<YOUR_ID>", scope_kind: "invoke", transition_name: "init_guestbook" })
+capability.grant({ namespace_id: "<NS_ID>", agent_id: "<YOUR_ID>", scope_kind: "invoke", transition_name: "sign" })
+capability.grant({ namespace_id: "<NS_ID>", agent_id: "<YOUR_ID>", scope_kind: "read",   path_glob: "**" })
 
-## Schema DSL (used in schema.register and transition params_schema)
+### 5. Invoke
+tx.invoke({ namespace_id: "<NS_ID>", transition_name: "init_guestbook", params: {}, idempotency_key: "init-v1" })
+tx.invoke({ namespace_id: "<NS_ID>", transition_name: "sign", params: { "author": "Alice", "message": "Hello!" }, idempotency_key: "sign-alice-1" })
 
-Schemas are JSON objects with a "t" discriminant. Every field value in an object schema is wrapped in { s: <schema>, optional?: true }.
+### 6. Read back
+log.read({ namespace_id: "<NS_ID>", log_id: "entries", from_offset: "0", limit: 100 })
 
-Scalar types:
-  { "t": "string" }                          — any string
-  { "t": "string", "min": 1, "max": 64 }    — bounded string
-  { "t": "string", "format": "email" }       — format: "uuid" | "email" | "url" | "datetime"
-  { "t": "int", "min": 0 }                   — integer
-  { "t": "number" }                          — float
+---
+
+## Schema DSL reference
+
+Every schema node has a "t" discriminant. Object schemas use "props" (or "properties" — both work).
+Fields in "props" are written as { "t": "...", "optional": true } — no extra wrapper needed.
+
+Scalars:
+  { "t": "string" }                              min?, max?, format?: "uuid"|"email"|"url"|"datetime"
+  { "t": "int" }                                 min?, max?
+  { "t": "number" }                              min?, max?
   { "t": "bool" }
   { "t": "null" }
-  { "t": "literal", "v": "active" }          — exact value
-  { "t": "enum", "vs": ["red","green","blue"] }
+  { "t": "literal", "v": "exact_value" }
+  { "t": "enum", "vs": ["a","b","c"] }
 
-Composite types:
-  { "t": "object", "extras": "strict", "props": {
-      "name":   { "s": { "t": "string", "min": 1, "max": 64 } },
-      "age":    { "s": { "t": "int", "min": 0 }, "optional": true }
-  }}
-  — "extras": "strict" rejects unknown keys; "strip" silently drops them
-
+Composite:
+  { "t": "object", "props": { "field": { "t": "string" }, "opt": { "t": "int", "optional": true } } }
+      extras?: "strict" (reject unknown keys) | "strip" (ignore them, default)
   { "t": "array", "items": { "t": "string" }, "min": 1, "max": 10 }
+  { "t": "union", "options": [{ "t": "string" }, { "t": "null" }] }
+  { "t": "blobref" }    — stored blob reference: { "$blob": "<sha256-hex>" }
 
-  { "t": "union", "options": [ { "t": "string" }, { "t": "null" } ] }
+Use schema.validate({ dsl: ... }) to test without registering. Returns { valid: true } or { valid: false, error: "..." }.
 
-Example — register a colour vote schema:
-  schema.register({
-    namespace_id: "<id>",
-    name: "colour_vote",
-    version: 1,
-    dsl: {
-      "t": "object",
-      "extras": "strict",
-      "props": {
-        "voter_id": { "s": { "t": "string", "format": "uuid" } },
-        "colour":   { "s": { "t": "enum", "vs": ["red","green","blue","yellow"] } }
-      }
-    }
-  })
+---
 
-## Transition Grammar (used in transition.register)
+## Transition grammar
 
-A transition has:
-  params_schema   — an object schema (same DSL as above) describing the call parameters
-  asserts         — zero or more precondition checks run before any mutation
-  ops             — one or more mutations run atomically
+params_schema  — an object schema describing call parameters
+asserts        — precondition array (checked before any mutation; roll back all if any fails)
+ops            — mutation array (run atomically; at least one required)
 
-### Expressions (used inside asserts and ops)
+### Expressions (every value position in asserts and ops is an Expr)
+{ "k": "lit",   "v": 42 }                          — literal
+{ "k": "param", "name": "fieldName" }               — value of a call parameter
+{ "k": "sys",   "name": "caller" }                  — caller | now | request_id | tx_id
 
-Every value position accepts an Expr:
-  { "k": "lit",   "v": 42 }              — literal value
-  { "k": "param", "name": "colour" }     — value of a call parameter
-  { "k": "sys",   "name": "caller" }     — sys vars: "caller" | "now" | "request_id" | "tx_id"
+### Ops
+{ "o": "doc.put",        "path": <E>, "schema_name": "...", "schema_version": 1, "value": <E> }
+{ "o": "doc.del",        "path": <E> }
+{ "o": "log.create",     "log_id": <E>, "schema_name": "...", "schema_version": 1 }
+{ "o": "log.append",     "log_id": <E>, "value": <E> }
+{ "o": "counter.create", "path": <E>, "initial": <E>, "min": <E>, "max": <E> }
+{ "o": "counter.incr",   "path": <E>, "delta": <E> }
+{ "o": "counter.reset",  "path": <E>, "to": <E> }
+{ "o": "lock.acquire",   "path": <E>, "ttl_ms": <E> }
+{ "o": "lock.refresh",   "path": <E>, "fence": <E>, "ttl_ms": <E> }
+{ "o": "lock.release",   "path": <E>, "fence": <E> }
 
-### Assert kinds (all optional, checked before any mutation)
-  { "a": "doc.exists",       "path": <Expr> }
-  { "a": "doc.version_eq",   "path": <Expr>, "version": <Expr> }
-  { "a": "doc.field_eq",     "path": <Expr>, "field": <Expr>, "value": <Expr> }
-  { "a": "counter.eq",       "path": <Expr>, "value": <Expr> }
-  { "a": "counter.gte",      "path": <Expr>, "value": <Expr> }
-  { "a": "counter.lte",      "path": <Expr>, "value": <Expr> }
-  { "a": "counter.in_range", "path": <Expr>, "min": <Expr>, "max": <Expr> }
-  { "a": "log.offset_eq",    "log_id": <Expr>, "offset": <Expr> }
-  { "a": "log.length_gte",   "log_id": <Expr>, "length": <Expr> }
-  { "a": "lock.fence_matches","path": <Expr>, "fence": <Expr> }
+### Asserts
+{ "a": "doc.exists",        "path": <E> }
+{ "a": "doc.version_eq",    "path": <E>, "version": <E> }
+{ "a": "doc.field_eq",      "path": <E>, "field": <E>, "value": <E> }
+{ "a": "counter.eq",        "path": <E>, "value": <E> }
+{ "a": "counter.gte",       "path": <E>, "value": <E> }
+{ "a": "counter.lte",       "path": <E>, "value": <E> }
+{ "a": "counter.in_range",  "path": <E>, "min": <E>, "max": <E> }
+{ "a": "log.offset_eq",     "log_id": <E>, "offset": <E> }
+{ "a": "log.length_gte",    "log_id": <E>, "length": <E> }
+{ "a": "lock.fence_matches","path": <E>, "fence": <E> }
 
-### Op kinds (the mutations)
-  { "o": "doc.put",       "path": <Expr>, "schema_name": "colour_vote", "schema_version": 1, "value": <Expr> }
-  { "o": "doc.del",       "path": <Expr> }
-  { "o": "log.create",    "log_id": <Expr>, "schema_name": "...", "schema_version": 1 }
-  { "o": "log.append",    "log_id": <Expr>, "value": <Expr> }
-  { "o": "counter.create","path": <Expr>, "initial": <Expr>, "min": <Expr>, "max": <Expr> }
-  { "o": "counter.incr",  "path": <Expr>, "delta": <Expr> }
-  { "o": "counter.reset", "path": <Expr>, "to": <Expr> }
-  { "o": "lock.acquire",  "path": <Expr>, "ttl_ms": <Expr> }
-  { "o": "lock.refresh",  "path": <Expr>, "fence": <Expr>, "ttl_ms": <Expr> }
-  { "o": "lock.release",  "path": <Expr>, "fence": <Expr> }
+---
 
-Example — register a cast_vote transition that appends to a log:
-  transition.register({
-    namespace_id: "<id>",
-    name: "cast_vote",
-    version: 1,
-    params_schema: {
-      "t": "object", "extras": "strict",
-      "props": {
-        "colour": { "s": { "t": "enum", "vs": ["red","green","blue","yellow"] } }
-      }
-    },
-    asserts: [],
-    ops: [
-      { "o": "log.append", "log_id": { "k": "lit", "v": "votes" }, "value": { "k": "param", "name": "colour" } }
-    ]
-  })
+## idempotency_key
 
-  (You would first need a log.create op in an init transition, or a separate init_votes transition.)
+Required on every tx.invoke. Replaying the same key returns the original result without re-running. Use a UUID or a deterministic string like "init-v1" or "vote-alice-round3".
+
+---
+
+## Capability model
+
+Owner (namespace creator) can grant/revoke admins and capabilities. Admins can grant/revoke capabilities.
+As owner you have full admin rights but still need explicit capability grants to use data tools.
+
+  scope_kind: "invoke"  →  transition_name: "my_transition"
+  scope_kind: "read"    →  path_glob: "entries/**"   (or "**" for all)
+
+---
 
 ## Paths
 
-Paths identify data within a namespace. Format: one or more slash-separated segments, no leading slash, no ".." traversal (e.g. "users/alice", "votes/2026"). Use consistent path conventions within your namespace.
-
-## tx.invoke
-
-  tx.invoke({
-    namespace_id: "<id>",
-    transition_name: "cast_vote",
-    params: { "colour": "red" },
-    idempotency_key: "<unique-per-call-string>"
-  })
-
-idempotency_key must be unique per logical operation. Replaying the same key returns the original result without re-running the transition. Use a UUID or a deterministic key (e.g. "vote-<user>-<round>").
-
-## Reading data
-
-  doc.get({ namespace_id, path })            — fetch a document
-  log.read({ namespace_id, log_id, from_offset: "0", limit: 100 })
-  log.head({ namespace_id, log_id })         — next offset + schema info
-  counter.get({ namespace_id, path })
-  lock.inspect({ namespace_id, path })
-
-All read tools require a read capability on a path glob matching the target path.`,
+Slash-separated, no leading slash, no ".." — e.g. "users/alice", "votes/round1/alice".`,
     },
   );
   registerAllTools(server);
