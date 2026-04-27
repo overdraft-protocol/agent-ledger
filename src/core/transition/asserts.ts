@@ -22,9 +22,15 @@ export async function evaluateAsserts(
       await evaluateAssert(tx, namespaceId, asserts[i]!, env);
     } catch (e) {
       if (e instanceof LedgerError) {
-        // Re-tag precondition failures with their index for debuggability.
-        e.details === undefined ? ((e as { details: unknown }).details = { assert_index: i })
-          : ((e as { details: Record<string, unknown> }).details["assert_index"] = i);
+        // Re-tag precondition failures with the failing assert's index AND its
+        // declared structure, so callers can pinpoint which precondition tripped
+        // without a separate transition.get round-trip.
+        const tag = { assert_index: i, assert: asserts[i] };
+        if (e.details === undefined) {
+          (e as { details: unknown }).details = tag;
+        } else {
+          Object.assign((e as { details: Record<string, unknown> }).details, tag);
+        }
         throw e;
       }
       throw e;
@@ -158,7 +164,50 @@ async function evaluateAssert(
       await assertLockFence(tx, namespaceId, path, fence);
       return;
     }
+    case "expr.cmp": {
+      // Pure-expression comparison — no DB access. Resolves both Exprs and
+      // compares them. eq/ne use deep JSON equality (matching doc.field_eq).
+      // Ordered ops (lt/lte/gt/gte) require both sides to be the same
+      // primitive scalar type (string OR number); anything else is a caller
+      // bug and surfaces as invalid_params, not a precondition_failed.
+      const lhs = resolveExpr(a.lhs, env);
+      const rhs = resolveExpr(a.rhs, env);
+      const ok = compareValues(a.op, lhs, rhs);
+      if (!ok) fail("expr.cmp", { op: a.op, lhs, rhs });
+      return;
+    }
   }
+}
+
+function compareValues(
+  op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte",
+  lhs: unknown,
+  rhs: unknown,
+): boolean {
+  if (op === "eq") return JSON.stringify(lhs) === JSON.stringify(rhs);
+  if (op === "ne") return JSON.stringify(lhs) !== JSON.stringify(rhs);
+  // Ordered ops: same primitive scalar type required.
+  const bothStrings = typeof lhs === "string" && typeof rhs === "string";
+  const bothNumbers =
+    typeof lhs === "number" && Number.isFinite(lhs) &&
+    typeof rhs === "number" && Number.isFinite(rhs);
+  if (!bothStrings && !bothNumbers) {
+    throw new LedgerError("invalid_params",
+      `expr.cmp op "${op}" requires both sides to be the same scalar type ` +
+      `(string or finite number); got ${describeType(lhs)} vs ${describeType(rhs)}`);
+  }
+  switch (op) {
+    case "lt":  return (lhs as string | number) <  (rhs as string | number);
+    case "lte": return (lhs as string | number) <= (rhs as string | number);
+    case "gt":  return (lhs as string | number) >  (rhs as string | number);
+    case "gte": return (lhs as string | number) >= (rhs as string | number);
+  }
+}
+
+function describeType(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  return typeof v;
 }
 
 function fail(kind: string, details: Record<string, unknown>): never {

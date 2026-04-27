@@ -26,6 +26,8 @@ export type Expr =
 
 // ---------- Asserts ----------
 
+export type CmpOp = "eq" | "ne" | "lt" | "lte" | "gt" | "gte";
+
 export type Assert =
   | { a: "doc.exists"; path: Expr }
   | { a: "doc.version_eq"; path: Expr; version: Expr }
@@ -36,7 +38,8 @@ export type Assert =
   | { a: "counter.in_range"; path: Expr; min: Expr; max: Expr }
   | { a: "log.offset_eq"; log_id: Expr; offset: Expr }
   | { a: "log.length_gte"; log_id: Expr; length: Expr }
-  | { a: "lock.fence_matches"; path: Expr; fence: Expr };
+  | { a: "lock.fence_matches"; path: Expr; fence: Expr }
+  | { a: "expr.cmp"; op: CmpOp; lhs: Expr; rhs: Expr };
 
 const AssertSchema: z.ZodType<Assert> = z.union([
   z.object({ a: z.literal("doc.exists"), path: ExprSchema }),
@@ -49,6 +52,12 @@ const AssertSchema: z.ZodType<Assert> = z.union([
   z.object({ a: z.literal("log.offset_eq"), log_id: ExprSchema, offset: ExprSchema }),
   z.object({ a: z.literal("log.length_gte"), log_id: ExprSchema, length: ExprSchema }),
   z.object({ a: z.literal("lock.fence_matches"), path: ExprSchema, fence: ExprSchema }),
+  z.object({
+    a: z.literal("expr.cmp"),
+    op: z.enum(["eq", "ne", "lt", "lte", "gt", "gte"]),
+    lhs: ExprSchema,
+    rhs: ExprSchema,
+  }),
 ]) as unknown as z.ZodType<Assert>;
 
 // ---------- Ops ----------
@@ -111,6 +120,7 @@ const VALID_ASSERT_TYPES = new Set([
   "doc.exists", "doc.version_eq", "doc.field_eq",
   "counter.eq", "counter.gte", "counter.lte", "counter.in_range",
   "log.offset_eq", "log.length_gte", "lock.fence_matches",
+  "expr.cmp",
 ]);
 
 // Fields an agent must supply (after defaults have been applied)
@@ -209,6 +219,8 @@ function preprocessAssert(raw: unknown): unknown {
       wrap("log_id"); wrap("length"); break;
     case "lock.fence_matches":
       wrap("path"); wrap("fence"); break;
+    case "expr.cmp":
+      wrap("lhs"); wrap("rhs"); break;
   }
   return assert;
 }

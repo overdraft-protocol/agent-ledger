@@ -85,7 +85,13 @@ export async function docPut(
     });
   }
   const validator = compileToZod(dsl);
-  validateWithBudget(validator, input.value);
+  validateWithBudget(validator, input.value, {
+    op: "doc.put",
+    path: input.path,
+    schema_name: input.schemaName,
+    schema_version: input.schemaVersion,
+    schema_dsl: dsl,
+  });
   const newBlobs = collectBlobRefs(dsl, input.value);
 
   // Lock and read any existing row for CAS + prior-blob accounting.

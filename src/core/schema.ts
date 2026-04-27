@@ -332,7 +332,11 @@ export function toJsonSchema(s: Dsl): Record<string, unknown> {
 // Validation with wall-clock budget (I11). On timeout we throw; Zod does not
 // natively support cancellation, but cheap schemas finish in microseconds —
 // exceeding the budget indicates pathological input or schema.
-export function validateWithBudget(validator: z.ZodTypeAny, value: unknown): void {
+export function validateWithBudget(
+  validator: z.ZodTypeAny,
+  value: unknown,
+  context?: Record<string, unknown>,
+): void {
   const start = performance.now();
   const result = validator.safeParse(value);
   const elapsed = performance.now() - start;
@@ -340,9 +344,14 @@ export function validateWithBudget(validator: z.ZodTypeAny, value: unknown): voi
     throw new LedgerError("validation_timeout", `validation exceeded ${VALIDATION_HARD_MS}ms`);
   }
   if (!result.success) {
-    throw new LedgerError("schema_violation", "value does not match schema", {
+    // Surface schema identity (and any caller-supplied context) so the agent
+    // can correlate the failure with a specific schema/op without a separate
+    // schema.get round-trip.
+    const details: Record<string, unknown> = {
       issues: result.error.issues,
-    });
+      ...(context ?? {}),
+    };
+    throw new LedgerError("schema_violation", "value does not match schema", details);
   }
 }
 

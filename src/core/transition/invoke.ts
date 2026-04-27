@@ -66,7 +66,11 @@ export async function invoke(
 
   // 2) Validate params.
   const paramsValidator = compileToZod(t.def.params_schema);
-  validateWithBudget(paramsValidator, input.params);
+  validateWithBudget(paramsValidator, input.params, {
+    against: "params_schema",
+    transition: { name: t.name, version: t.version },
+    params_schema: t.def.params_schema,
+  });
 
   // 3) Idempotency check (outside tx; any stored result short-circuits).
   const stored = await db

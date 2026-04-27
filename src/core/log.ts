@@ -146,7 +146,13 @@ export async function logAppend(
   // Validate against the log's bound schema.
   const { dsl } = await loadSchema(tx, namespaceId, row.schema_name, row.schema_version);
   const validator = compileToZod(dsl);
-  validateWithBudget(validator, value);
+  validateWithBudget(validator, value, {
+    op: "log.append",
+    log_id: logId,
+    schema_name: row.schema_name,
+    schema_version: row.schema_version,
+    schema_dsl: dsl,
+  });
 
   const offset = BigInt(row.offset_id);
   await tx

@@ -12,6 +12,8 @@ import {
 import {
   registerSchema,
   deprecateSchema,
+  listSchemas,
+  getSchema,
 } from "../control/schema.js";
 import {
   registerTransition,
@@ -102,6 +104,7 @@ export function registerAllTools(server: McpServer): void {
   registerSchemaTools(server);
   registerRoleTools(server);
   registerTransitionTools(server);
+  registerProtocolTools(server);
   registerAuditTools(server);
   registerDataTools(server);
   registerBlobTools(server);
@@ -210,10 +213,10 @@ function registerNamespaceTools(server: McpServer): void {
 
 // ---------- schema.* ----------
 //
-// schema.register / schema.deprecate / schema.validate only — schemas are an
-// internal artifact of the protocol designer. Agents discover types through
-// the inlined `schema_dsl` returned by doc.get / log.head / log.read and
-// transition.get's `outputs` field.
+// schemas are inspectable: list/get are visible to anyone with namespace
+// visibility (the same gate as transition.list/get) so agents can read the
+// types a protocol uses. Mutations (register / deprecate) require
+// manage_roles. validate is unauthenticated — it's a pure DSL-parser dry-run.
 
 function registerSchemaTools(server: McpServer): void {
   server.registerTool(
@@ -295,6 +298,46 @@ function registerSchemaTools(server: McpServer): void {
         }
         throw e;
       }
+    }),
+  );
+
+  server.registerTool(
+    "schema.list",
+    {
+      description:
+        "List schemas registered in a namespace. Visible to anyone who can " +
+        "see the namespace. Returns name, version, deprecated status — call " +
+        "schema.get for the full DSL.",
+      inputSchema: {
+        namespace_id: UUID,
+        include_deprecated: z.boolean().default(false),
+      },
+    },
+    wrap("schema.list", async (args) => {
+      const ctx = requireCtx();
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+      return await listSchemas(ctx.db, args.namespace_id, args.include_deprecated);
+    }),
+  );
+
+  server.registerTool(
+    "schema.get",
+    {
+      description:
+        "Fetch a schema's DSL by name + version. Visible to anyone who can " +
+        "see the namespace. Useful when designing new transitions that " +
+        "reference an existing schema, or when debugging a schema_violation " +
+        "error to see exactly what shape was expected.",
+      inputSchema: {
+        namespace_id: UUID,
+        name: z.string().min(1).max(128),
+        version: z.number().int().positive(),
+      },
+    },
+    wrap("schema.get", async (args) => {
+      const ctx = requireCtx();
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+      return await getSchema(ctx.db, args.namespace_id, args.name, args.version);
     }),
   );
 }
@@ -601,9 +644,12 @@ function registerTransitionTools(server: McpServer): void {
     "transition.get",
     {
       description:
-        "Fetch a transition's full definition (params_schema, description, " +
-        "required_role) and its declared output schemas. Visible to anyone " +
-        "who can see the namespace — this is the public interface.",
+        "Fetch a transition's full source: params_schema, asserts, ops, " +
+        "description, required_role, and the output schemas referenced by " +
+        "doc.put / log.create ops. Visible to anyone who can see the " +
+        "namespace — transitions are the public spec of a protocol, so the " +
+        "body is inspectable. Read existing transitions as templates when " +
+        "designing your own.",
       inputSchema: {
         namespace_id: UUID,
         name: z.string().min(1).max(128),
@@ -624,6 +670,8 @@ function registerTransitionTools(server: McpServer): void {
         registered_at: t.registered_at,
         registered_by: t.registered_by,
         params_schema: t.def.params_schema,
+        asserts: t.def.asserts,
+        ops: t.def.ops,
         outputs,
       };
     }),
@@ -651,6 +699,91 @@ function registerTransitionTools(server: McpServer): void {
         version: args.version,
       });
       return { deprecated: true };
+    }),
+  );
+}
+
+// ---------- protocol.* ----------
+//
+// One-shot discovery aggregate. Saves a joining agent ~5 round trips by
+// returning the namespace's full public spec — roles, schemas, transitions
+// (with full bodies + inlined output schemas) — in a single response.
+// Visible to anyone with namespace visibility, same gate as the underlying
+// list/get tools.
+
+function registerProtocolTools(server: McpServer): void {
+  server.registerTool(
+    "protocol.describe",
+    {
+      description:
+        "Aggregate view of a namespace's protocol: roles (with capabilities), " +
+        "schemas (with DSL), transitions (with full asserts + ops + output " +
+        "schemas). Use this as the first call when joining a namespace — it " +
+        "gives you the entire spec in one response so you don't have to " +
+        "round-trip role.list / role.get / schema.list / schema.get / " +
+        "transition.list / transition.get individually.",
+      inputSchema: {
+        namespace_id: UUID,
+        include_deprecated: z.boolean().default(false),
+      },
+    },
+    wrap("protocol.describe", async (args) => {
+      const ctx = requireCtx();
+      await requireNamespaceVisible(ctx.db, args.namespace_id);
+
+      const ns = await ctx.db
+        .selectFrom("namespaces")
+        .select(["id", "alias", "owner_agent_id", "created_at"])
+        .where("id", "=", args.namespace_id)
+        .executeTakeFirstOrThrow();
+
+      const roleSummaries = await listRoles(ctx.db, args.namespace_id);
+      const roles = await Promise.all(
+        roleSummaries.map((r) => getRole(ctx.db, args.namespace_id, r.name)),
+      );
+
+      const schemaSummaries = await listSchemas(
+        ctx.db, args.namespace_id, args.include_deprecated,
+      );
+      const schemas = await Promise.all(
+        schemaSummaries.map((s) =>
+          getSchema(ctx.db, args.namespace_id, s.name, s.version),
+        ),
+      );
+
+      const transitionSummaries = await listTransitions(
+        ctx.db, args.namespace_id, args.include_deprecated,
+      );
+      const transitions = await Promise.all(
+        transitionSummaries.map(async (s) => {
+          const t = await getTransition(ctx.db, args.namespace_id, s.name, s.version);
+          const outputs = await buildTransitionOutputs(
+            ctx.db, args.namespace_id, t.def.ops,
+          );
+          return {
+            name: t.name,
+            version: t.version,
+            description: t.description,
+            required_role: t.required_role,
+            deprecated: t.deprecated,
+            params_schema: t.def.params_schema,
+            asserts: t.def.asserts,
+            ops: t.def.ops,
+            outputs,
+          };
+        }),
+      );
+
+      return {
+        namespace: {
+          id: ns.id,
+          alias: ns.alias,
+          owner_agent_id: ns.owner_agent_id,
+        },
+        roles,
+        schemas,
+        transitions,
+      };
     }),
   );
 }
